@@ -1,0 +1,1119 @@
+"""
+Docket autonomous agent — the orchestrator that works tickets off the queue.
+
+Design (see DOCKET.md): a thin orchestrator OWNS the lifecycle transitions and
+invokes a headless Claude Code agent ONE PHASE AT A TIME. The agent supplies the
+*content* (assessment, plan, code, review); the orchestrator drives state and
+records everything on the ticket timeline so the board always shows what's
+happening — including a live "currently working on" ticker fed by the agent's
+tool activity.
+
+Phases: Assessment → Planning → In Development → Self-Review → PR.
+  - Assessment + Planning are READ-ONLY (Edit/Write disallowed) — always safe.
+  - In Development / Self-Review / PR WRITE code + push a branch, so they are
+    gated behind DOCKET_AGENT_WRITES (default off). With writes off, the agent
+    grooms a ticket (assess + plan) and parks it at Planning with a note.
+
+Guardrails: per-phase --max-turns + --max-budget-usd, a subprocess timeout, the
+hybrid grooming gate (bounce vague P0/P1 asks to Needs Info; best-effort the
+rest), and any failure → Stalled (never silently stuck). NEVER auto-merges.
+
+Runs as root (has claude creds + the GitHub push key + the Neil B
+<thenofisamizdat@gmail.com> commit identity). Lightweight: imports only
+docket_storage (no Neo4j / embeddings).
+
+Run a single pass (pick the top queued ticket, work it, exit):
+    python -m services.docket_agent --once
+Run the continuous loop:
+    python -m services.docket_agent
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from docket_dev import storage as dk
+from docket_dev.auth import tester_email
+from docket_dev.config import CONFIG
+
+# --- config (env-overridable; populated from .docket/config.toml via
+# config.apply_env() before this module is imported by the CLI) ---
+WRITES_ENABLED = os.environ.get("DOCKET_AGENT_WRITES", "0") == "1"
+# Push gate: by default push when writes are on, but DOCKET_AGENT_PUSH=0 lets us
+# run the full implement+review locally and HOLD the push for manual inspection.
+PUSH_ENABLED = os.environ.get("DOCKET_AGENT_PUSH", "1" if WRITES_ENABLED else "0") == "1"
+# Auto-merge: squash-merge the PR via the GitHub API once self-review passes, then
+# mark the ticket done. Requires a real PR object (i.e. a GitHub token); without a
+# token it safely no-ops and the ticket waits at PR for a manual merge.
+AUTO_MERGE = os.environ.get("DOCKET_AGENT_AUTO_MERGE", "0") == "1"
+# Default model for EVERY phase. Docket defaults to the strongest model (Opus)
+# because pipeline quality matters more than per-ticket cost/speed; override per
+# install via [agent].model in .docket/config.toml or DOCKET_AGENT_MODEL.
+MODEL = os.environ.get("DOCKET_AGENT_MODEL", "opus")
+# A stronger model the recovery process escalates to when the default one ran
+# out of room (SCOPE) or couldn't fix its own work (DEFECT after a corrective
+# pass). Escalation is targeted, not default — applied only by the recovery router.
+STRONG_MODEL = os.environ.get("DOCKET_AGENT_STRONG_MODEL", "opus")
+MAIN_CHECKOUT = Path(os.environ.get("DOCKET_MAIN_CHECKOUT", str(Path.cwd())))
+WORKTREE_DIR = Path(os.environ.get("DOCKET_WORKTREE_DIR", str(Path.cwd() / ".docket" / "worktrees")))
+REPO_SLUG = os.environ.get("DOCKET_REPO_SLUG", "")
+# Branch worktrees fork from / PRs target, and the remote to push to.
+BASE_BRANCH = os.environ.get("DOCKET_BASE_BRANCH", "main")
+REMOTE = os.environ.get("DOCKET_REMOTE", "origin")
+POLL_SECS = int(os.environ.get("DOCKET_AGENT_POLL", "20"))
+# GitHub token for real PR-object creation; without one we fall back to pushing
+# the branch and recording a compare URL (Neil opens the PR by hand).
+GITHUB_TOKEN = (os.environ.get("DOCKET_GITHUB_TOKEN")
+                or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "")
+# Email sender identity for msmtp-delivered notifications.
+MAIL_FROM = os.environ.get("DOCKET_MAIL_FROM", "Docket <docket@localhost>")
+
+
+def _notify_default() -> str:
+    """Fallback notification recipient (stalled/pr_ready/needs_info) when a
+    ticket has no creator — the configured default, else the first tester."""
+    rec = (CONFIG.default_recipient or "").strip().lower()
+    if rec:
+        return rec
+    return CONFIG.testers[0]["username"].lower() if CONFIG.testers else ""
+
+
+READONLY_TOOLS = ["Read", "Grep", "Glob", "Bash(git log:*)", "Bash(git diff:*)",
+                  "Bash(ls:*)", "Bash(cat:*)", "Bash(find:*)", "Bash(grep:*)"]
+WRITE_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
+
+# --- Resilience knobs (the "dependable & failsafe" core) ---
+# Transient infra failures (overloaded / rate-limit / timeout / network / CLI
+# crash) are RETRIED with exponential backoff inside run_claude rather than
+# stalling a ticket on the first hiccup. Only a genuine error or exhausted
+# retries stalls — and that stall is tagged transient so a human knows a plain
+# resubmit is all it needs. Docket must never park a ticket because the API blipped.
+AGENT_RETRIES = int(os.environ.get("DOCKET_AGENT_RETRIES", "3"))
+RETRY_BACKOFF_SECS = float(os.environ.get("DOCKET_AGENT_BACKOFF", "10"))
+# Self-review corrective passes: how many implement->review cycles before giving
+# up. The loop is REAL and bounded (the old code promised "one corrective loop"
+# but never re-ran development — it just stalled on the first FAIL).
+MAX_DEV_PASSES = int(os.environ.get("DOCKET_MAX_DEV_PASSES", "3"))
+# Self-healing: a transient failure that survives the in-phase retries doesn't
+# stall — it auto-requeues (the agent works other tickets meanwhile, giving the
+# API time to recover) up to this many times before finally parking in Stalled.
+MAX_AUTO_RECOVERIES = int(os.environ.get("DOCKET_AUTO_RECOVERIES", "5"))
+AUTO_RETRY_MARK = "[auto-retry]"  # stable token used to count prior auto-requeues
+
+# Substrings that mark a failure as transient/infra (case-insensitive). These are
+# retryable; anything else is a genuine result and goes to reason-driven recovery.
+_TRANSIENT_MARKERS = (
+    "529", "overloaded", "rate limit", "rate_limit", "ratelimit",
+    "timed out", "timeout", "phase timed out", "connection", "econnreset",
+    "network", "temporarily", "try again", "500 internal", "502", "503", "504",
+    "internal server error", "bad gateway", "service unavailable",
+    "gateway timeout", "claude failed",
+)
+
+
+def _is_transient(text: str) -> bool:
+    """Does this error look like a retryable infra blip rather than a real
+    problem with the ticket?"""
+    low = (text or "").lower()
+    return any(m in low for m in _TRANSIENT_MARKERS)
+
+
+# A SCOPE failure = the phase ran out of room (max turns / budget). The reason is
+# "too big / too hard for the resources given", so the right correction is more
+# capability — a stronger model + bigger limits — not a blind re-run.
+_SCOPE_SUBTYPES = ("error_max_turns", "error_max_budget", "error_budget_exceeded")
+_SCOPE_MARKERS = ("max turns", "maximum number of turns", "max-turns",
+                  "max budget", "max-budget", "budget exceeded", "budget limit")
+
+
+def _is_scope(out: dict) -> bool:
+    """Did this failure come from exhausting the turn/budget ceiling?"""
+    if (out.get("subtype") or "").lower() in _SCOPE_SUBTYPES:
+        return True
+    low = (out.get("text") or "").lower()
+    return any(m in low for m in _SCOPE_MARKERS)
+
+
+def log(msg: str) -> None:
+    print(f"[docket-agent] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Headless Claude runner
+# ---------------------------------------------------------------------------
+
+def _short(p: str) -> str:
+    return p.split("/")[-1] if p else ""
+
+
+def _summarize_tool(block: dict) -> str:
+    name = block.get("name", "")
+    inp = block.get("input", {}) or {}
+    if name == "Read":
+        return f"Reading {_short(inp.get('file_path', ''))}"
+    if name in ("Edit", "Write", "NotebookEdit"):
+        return f"Editing {_short(inp.get('file_path', ''))}"
+    if name == "Bash":
+        return "Running: " + str(inp.get("command", ""))[:60]
+    if name in ("Grep", "Glob"):
+        return f"Searching {str(inp.get('pattern', ''))[:40]}"
+    if name == "Task":
+        return "Delegating to a sub-agent"
+    if name == "TodoWrite":
+        return "Updating its plan"
+    return f"Using {name}"
+
+
+def run_claude(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
+    """Resilient wrapper around _run_claude_once: retry transient infra failures
+    (overloaded / rate-limit / timeout / network / CLI crash) with exponential
+    backoff. Returns is_error=True only on a non-transient error or once retries
+    are exhausted (then the result carries 'retried': True so the caller can tag
+    the stall as transient)."""
+    out = None
+    for attempt in range(1, AGENT_RETRIES + 1):
+        out = _run_claude_once(prompt, cwd, on_activity=on_activity, **kw)
+        if not out["is_error"] or not _is_transient(out["text"]):
+            return out
+        if attempt >= AGENT_RETRIES:
+            out["retried"] = True
+            return out
+        wait = RETRY_BACKOFF_SECS * (2 ** (attempt - 1))
+        msg = (f"transient error ({(out['text'] or '').strip()[:60]}…) — retrying "
+               f"in {int(wait)}s (attempt {attempt + 1}/{AGENT_RETRIES})")
+        log("  " + msg)
+        if on_activity:
+            try:
+                on_activity(msg)
+            except Exception:
+                pass
+        time.sleep(wait)
+    return out
+
+
+def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
+              model=None, label: str = "", on_activity=None, **kw) -> dict:
+    """Run a pipeline phase resiliently, with SCOPE escalation. If the phase fails
+    because it ran out of room (max turns / budget) — not an infra blip — retry it
+    ONCE with a stronger model and doubled limits. This is the 'correct based on
+    the reason' principle: a scope problem gets more capability, not a blind re-run."""
+    out = run_claude(prompt, cwd, max_turns=max_turns, max_budget_usd=max_budget_usd,
+                     model=model, on_activity=on_activity, **kw)
+    if out["is_error"] and _is_scope(out):
+        msg = (f"{label or 'phase'} ran out of room — escalating to {STRONG_MODEL} "
+               f"with 2× turns/budget and retrying once")
+        log("  " + msg)
+        if on_activity:
+            try:
+                on_activity(msg)
+            except Exception:
+                pass
+        out = run_claude(prompt, cwd, max_turns=max_turns * 2,
+                         max_budget_usd=max_budget_usd * 2, model=STRONG_MODEL,
+                         on_activity=on_activity, **kw)
+        out["escalated"] = True
+    return out
+
+
+def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_tools=None,
+               permission_mode="default", max_turns=20, max_budget_usd=2.0,
+               timeout=900, on_activity=None, model=None) -> dict:
+    """Invoke Claude Code headless in `cwd`, streaming progress. Returns
+    {text, is_error, cost, turns, session_id, subtype}."""
+    cmd = ["claude", "-p", prompt,
+           "--output-format", "stream-json", "--verbose",
+           "--max-turns", str(max_turns),
+           "--permission-mode", permission_mode,
+           "--model", model or MODEL]
+    if max_budget_usd:
+        cmd += ["--max-budget-usd", str(max_budget_usd)]
+    if allowed_tools:
+        cmd += ["--allowedTools", *allowed_tools]
+    if disallowed_tools:
+        cmd += ["--disallowedTools", *disallowed_tools]
+
+    out = {"text": "", "is_error": False, "cost": 0.0, "turns": 0, "session_id": "",
+           "subtype": ""}
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1,
+                                env=os.environ.copy())
+    except FileNotFoundError:
+        out["is_error"] = True
+        out["text"] = "claude CLI not found on PATH"
+        return out
+
+    start = time.monotonic()
+    try:
+        for line in proc.stdout:
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                out["is_error"] = True
+                out["text"] = out["text"] or "(phase timed out)"
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use" and on_activity:
+                        desc = _summarize_tool(block)
+                        if desc:
+                            on_activity(desc)
+            elif t == "result":
+                out["text"] = ev.get("result", "") or ""
+                out["is_error"] = bool(ev.get("is_error"))
+                out["cost"] = ev.get("total_cost_usd", 0.0) or 0.0
+                out["turns"] = ev.get("num_turns", 0) or 0
+                out["session_id"] = ev.get("session_id", "") or ""
+                out["subtype"] = ev.get("subtype", "") or ""
+                # A turn/budget-capped run reports success-ish but is really a
+                # SCOPE failure; surface it as an error so recovery can escalate.
+                if out["subtype"] in _SCOPE_SUBTYPES:
+                    out["is_error"] = True
+                    out["text"] = out["text"] or f"ran out of room ({out['subtype']})"
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out["is_error"] = True
+    if proc.returncode not in (0, None) and not out["text"]:
+        out["is_error"] = True
+        try:
+            out["text"] = (proc.stderr.read() or "claude failed")[:2000]
+        except Exception:
+            out["text"] = "claude failed"
+    out["duration"] = round(time.monotonic() - start, 1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Worktrees
+# ---------------------------------------------------------------------------
+
+def ensure_worktree(ticket: dict) -> tuple[Path, str]:
+    """Create (or reuse) a per-ticket git worktree + branch off the base branch."""
+    tid = ticket["id"]
+    branch = f"docket/DKT-{tid}"
+    path = WORKTREE_DIR / f"DKT-{tid}"
+    WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path, branch
+    subprocess.run(
+        ["git", "-C", str(MAIN_CHECKOUT), "worktree", "add", "-B", branch,
+         str(path), BASE_BRANCH],
+        check=True, capture_output=True, text=True,
+    )
+    return path, branch
+
+
+def workdir_for(ticket: dict) -> tuple[Path, str | None]:
+    """Where the agent runs. With writes on, a per-ticket worktree; otherwise the
+    read-only main checkout (Edit/Write are disallowed in read-only phases anyway)."""
+    if WRITES_ENABLED:
+        return ensure_worktree(ticket)
+    return MAIN_CHECKOUT, None
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+def _ctx(t: dict) -> str:
+    return (f"Ticket {t['ref']} ({t['type']}, priority {t['priority']}):\n"
+            f"TITLE: {t['title']}\n"
+            f"DESCRIPTION: {t.get('description') or '(none)'}\n"
+            f"ACCEPTANCE CRITERIA: {t.get('acceptance_criteria') or '(none)'}\n")
+
+
+def _repo_profile() -> str:
+    """The stored codebase profile (written by `docket recognize`), injected as
+    grounding so assessment/planning are repo-aware from the first ticket. Empty
+    if no profile has been generated yet."""
+    try:
+        text = CONFIG.profile_path.read_text()
+    except (OSError, FileNotFoundError):
+        return ""
+    text = text.strip()
+    if not text:
+        return ""
+    return ("\nCODEBASE PROFILE (generated overview — verify against the live repo "
+            "as needed):\n" + text[:4000] + "\n")
+
+
+def _shipped_ctx() -> str:
+    """Recently shipped tickets, so assessment can spot follow-ups: a new ask
+    that's really 'the old fix didn't stick' should be linked, not treated as
+    fresh work — it counts against the shipped ticket's post-ship health."""
+    try:
+        shipped = dk.shipped_tickets()
+    except Exception:
+        return ""
+    if not shipped:
+        return ""
+    lines = "\n".join(f"  {s['ref']}: {s['title']}" for s in shipped[-20:])
+    return (
+        "\nPREVIOUSLY SHIPPED TICKETS:\n" + lines + "\n"
+        "If this request is really a follow-up to one of those (the shipped "
+        "solution didn't fully solve it, regressed it, or missed the point), add "
+        "this line directly above the VERDICT line:\n"
+        "  RELATED: DKT-<n> || <one sentence: why it's a follow-up>\n"
+        "If none apply, omit the RELATED line entirely.\n"
+    )
+
+
+def assess_prompt(t: dict) -> str:
+    return (
+        "You are the assessment phase of an autonomous dev pipeline working on "
+        "this codebase. Explore the repo (READ ONLY — do not edit anything) and "
+        "assess the following request.\n\n" + _ctx(t) + _repo_profile() +
+        "\nProduce a concise assessment (≈150-250 words) covering: what the change "
+        "involves, the key files/areas it would touch, risks or unknowns, and "
+        "whether the ask is clear enough to implement.\n"
+        + _shipped_ctx() +
+        "End your message with EXACTLY ONE final line, either:\n"
+        "  VERDICT: PROCEED\n"
+        "or, if the request is too vague/ambiguous to implement well:\n"
+        "  VERDICT: NEEDS_INFO || <one sentence: the specific question(s) for the requester>"
+    )
+
+
+def plan_prompt(t: dict, assessment: str) -> str:
+    return (
+        "You are the planning phase of an autonomous dev pipeline. Based on the "
+        "codebase (READ ONLY) and the assessment below, write a concrete, "
+        "step-by-step implementation plan: the files to change, the approach for "
+        "each, and how it will be tested/verified. Be specific and ordered.\n\n"
+        + _ctx(t) + _repo_profile() + "\nASSESSMENT:\n" + assessment[:2000]
+    )
+
+
+def implement_prompt(t: dict, plan: str) -> str:
+    return (
+        "You are the implementation phase of an autonomous dev pipeline. Implement "
+        "the plan below in this worktree. Make focused, correct changes; follow the "
+        "surrounding code's style. Do not commit or push — just edit files. When "
+        "done, briefly summarise what you changed.\n\n"
+        + _ctx(t) + "\nPLAN:\n" + plan[:4000]
+    )
+
+
+def reimplement_prompt(t: dict, plan: str, fix: str) -> str:
+    return (
+        "You are the implementation phase of an autonomous dev pipeline, on a "
+        "CORRECTIVE pass. Your previous changes are already in this worktree but "
+        "self-review found problems. FIX exactly those problems — keep what works, "
+        "change what's broken. Do not commit or push; just edit files. When done, "
+        "briefly summarise what you changed and why it resolves the feedback.\n\n"
+        + _ctx(t) +
+        "\nSELF-REVIEW FEEDBACK TO ADDRESS:\n" + (fix or "(see prior review)")[:1500] +
+        "\n\nORIGINAL PLAN (for reference):\n" + plan[:2500]
+    )
+
+
+def test_instructions_prompt(t: dict) -> str:
+    return (
+        "You are writing test instructions for a NON-TECHNICAL tester to verify the change "
+        "just implemented in this worktree. Look at the diff (`git diff main`) and the "
+        "acceptance criteria below, then write SHORT, numbered, plain-language steps: what to "
+        "do and exactly what they should see if it works. No code, no jargon, no file paths — "
+        "write it for someone who only uses the app's UI.\n\n" + _ctx(t)
+    )
+
+
+def review_prompt(t: dict) -> str:
+    return (
+        "You are the self-review phase. Review the uncommitted changes in this "
+        "worktree against the ticket's acceptance criteria. Run any quick checks "
+        "you can (compile/lint/tests). Report problems found and whether the work "
+        "is ready.\n\n" + _ctx(t) +
+        "\nEnd with EXACTLY ONE final line: 'REVIEW: PASS' or 'REVIEW: FAIL || <what to fix>'."
+    )
+
+
+def triage_prompt(t: dict, phase: str, failure: str, diff_summary: str = "") -> str:
+    return (
+        "You are the RECOVERY-TRIAGE step of an autonomous dev pipeline. A ticket "
+        "could not be completed automatically. Your job is to diagnose WHY and "
+        "choose the smartest next action — not to fix it now, and never to just "
+        "blindly retry. Explore the repo READ-ONLY as needed to judge.\n\n"
+        + _ctx(t) +
+        f"\nFAILED PHASE: {phase}\nWHAT WENT WRONG:\n{(failure or '(no detail)')[:1800]}\n"
+        + (f"\nCHANGES MADE SO FAR:\n{diff_summary[:1000]}\n" if diff_summary else "")
+        + "\nDecide the single best recovery and end with EXACTLY ONE final line:\n"
+        "  TRIAGE: RETRY  — a transient/infra blip (overload, timeout, flaky); just run it again later\n"
+        "  TRIAGE: NEEDS_INFO || <the specific question(s) the requester must answer> "
+        "— the ask is ambiguous, contradictory, or missing a detail/repro needed to implement it correctly\n"
+        "  TRIAGE: BLOCKED || <why no automated fix can proceed and what a human must do> "
+        "— a design decision, external access, or data the agent cannot obtain is required\n\n"
+        "Prefer NEEDS_INFO whenever a human *answer* would unblock automated work. "
+        "Use BLOCKED only when human *action* (not just an answer) is required. "
+        "Make the question/reason concrete and specific to THIS ticket."
+    )
+
+
+import re as _re
+
+
+def _strip_control(text: str) -> str:
+    """Remove the trailing machine-readable 'VERDICT:'/'REVIEW:' control line so
+    the stored/displayed body is clean prose."""
+    return _re.sub(r"\n*\b(VERDICT|REVIEW|RELATED)\s*:.*$", "", text or "",
+                   flags=_re.IGNORECASE | _re.DOTALL).strip()
+
+
+def _pr_summary(t: dict, impl_text: str = "", files_stat: str = "") -> str:
+    """A detailed, human-readable description of the work, built from the ticket
+    (the *why*) and what the agent actually implemented (the *what*). Used for
+    BOTH the commit-message body and the create_pr() body so they tell the same
+    story — and because, with no PAT, GitHub prefills the PR from the commit body
+    when Neil opens the compare URL. Replaces the old 'Autonomous Docket
+    implementation.' boilerplate."""
+    ref = t.get("ref") or f"DKT-{t['id']}"
+    parts: list[str] = []
+    desc = (t.get("description") or "").strip()
+    if desc:
+        parts.append(f"## Why\n{desc}")
+    impl = _strip_control(impl_text or "").strip()
+    if impl:
+        parts.append(f"## What changed\n{impl[:1800]}")
+    if files_stat.strip():
+        parts.append(f"## Files\n```\n{files_stat.strip()}\n```")
+    ac = (t.get("acceptance_criteria") or "").strip()
+    if ac:
+        parts.append(f"## Acceptance criteria\n{ac}")
+    parts.append(f"_Opened by the Docket agent for {ref}. Never auto-merged — "
+                 f"this PR is the human review gate._")
+    return "\n\n".join(parts)
+
+
+def parse_verdict(text: str, key: str) -> tuple[str, str]:
+    """Return (verdict, detail) from a trailing 'KEY: ...' line. verdict is the
+    first token (e.g. PROCEED / NEEDS_INFO / PASS / FAIL)."""
+    verdict, detail = "", ""
+    for line in reversed(text.strip().splitlines()):
+        line = line.strip()
+        if line.upper().startswith(key.upper() + ":"):
+            rest = line.split(":", 1)[1].strip()
+            if "||" in rest:
+                v, d = rest.split("||", 1)
+                verdict, detail = v.strip().upper(), d.strip()
+            else:
+                verdict = rest.strip().upper()
+            break
+    return verdict, detail
+
+
+# ---------------------------------------------------------------------------
+# Phase driver
+# ---------------------------------------------------------------------------
+
+def _stall(tid: int, why: str, *, transient: bool = False) -> None:
+    log(f"DKT-{tid} STALLED{' [transient]' if transient else ''}: {why}")
+    try:
+        note = f"Stalled: {why}"
+        if transient:
+            note += ("\n\n_(Transient infrastructure error — the agent/API blipped "
+                     "and automatic retries were exhausted. Resubmit the ticket as-is; "
+                     "no change to the request is needed.)_")
+        dk.add_event(tid, "note", summary=note, actor="agent")
+        dk.transition(tid, "stalled", actor="agent", summary=why[:120])
+        t = dk.get_ticket(tid)
+        subj = f"Docket {t['ref']}: stalled" + (" (transient — just resubmit)" if transient else "")
+        dk.enqueue_notification(tid, _notify_default(), "stalled", subject=subj, body=why[:500])
+    except Exception as e:
+        log(f"  (failed to record stall: {e})")
+
+
+def _auto_retry_count(tid: int) -> int:
+    """How many times this ticket has already been auto-requeued for a transient
+    failure (counted from the timeline so it survives agent restarts)."""
+    try:
+        return sum(1 for e in dk.get_events(tid)
+                   if e.get("actor") == "agent" and AUTO_RETRY_MARK in (e.get("summary") or ""))
+    except Exception:
+        return 0
+
+
+def _recover_or_stall(tid: int, why: str, *, transient: bool) -> None:
+    """Failsafe failure handler. A transient/infra failure self-heals: the ticket
+    is auto-requeued (bounded by MAX_AUTO_RECOVERIES) so it retries once capacity
+    frees up, instead of stranding in Stalled and needing a human to resubmit.
+    Only a genuine problem — or a transient one that persists past the cap —
+    becomes a human-gated Stall."""
+    if transient and _auto_retry_count(tid) < MAX_AUTO_RECOVERIES:
+        n = _auto_retry_count(tid) + 1
+        log(f"DKT-{tid} transient failure — auto-requeue {n}/{MAX_AUTO_RECOVERIES}: {why[:80]}")
+        try:
+            dk.add_event(tid, "note", actor="agent",
+                         summary=(f"{AUTO_RETRY_MARK} Transient infra failure "
+                                  f"(attempt {n}/{MAX_AUTO_RECOVERIES}) — auto-requeued; "
+                                  f"will retry when capacity frees up. No human action "
+                                  f"needed.\n\n{why[:300]}"))
+            dk.transition(tid, "queued", actor="agent",
+                          summary=f"Auto-requeue after transient failure ({n}/{MAX_AUTO_RECOVERIES})")
+            return
+        except Exception as e:
+            log(f"  (auto-requeue failed, stalling instead: {e})")
+    _stall(tid, why, transient=transient)
+
+
+def _to_needs_info(t: dict, question: str, *, phase: str = "") -> None:
+    """Bounce a ticket to the REQUESTER for a specific answer — a productive
+    correction (the ask gets clarified and re-enters the pipeline) rather than a
+    dead-end Stall aimed at the maintainer."""
+    tid = t["id"]
+    q = (question or "").strip() or ("The agent needs clarification to proceed — "
+                                     "please add detail or a concrete repro.")
+    try:
+        dk.add_event(tid, "comment", actor="agent", summary=f"Needs clarification: {q}")
+        dk.transition(tid, "needs_info", actor="agent",
+                      summary=f"Agent needs input to proceed{(' (' + phase + ')') if phase else ''}")
+        dk.enqueue_notification(tid, t.get("created_by") or _notify_default(), "needs_info",
+                                subject=f"Docket {t['ref']}: needs your input", body=q)
+        log(f"  → Needs Info: {q[:100]}")
+    except Exception as e:
+        log(f"  (needs_info routing failed, stalling instead: {e})")
+        _stall(tid, f"{phase}: needs clarification — {q[:200]}")
+
+
+def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "") -> None:
+    """Reason-driven recovery router. Instead of blindly retrying, classify the
+    failure and take the matching corrective action:
+
+      INFRA (deterministic)  → self-heal: auto-requeue (bounded), then transient stall
+      RETRY (triage)         → treat as transient (auto-requeue)
+      NEEDS_INFO (triage)    → bounce to the requester with a specific question
+      BLOCKED (triage)       → human-gated stall, with the classified reason
+
+    SCOPE failures are handled upstream by run_phase (escalate model+budget) and
+    DEFECT failures by the in-dev corrective loop (re-implement, model-escalated);
+    this router is the terminal decision once those avenues are spent."""
+    tid = t["id"]
+    # Fast deterministic path — an obvious infra blip needs no LLM to diagnose.
+    if _is_transient(failure):
+        return _recover_or_stall(tid, f"{phase} failed: {failure[:160]}", transient=True)
+    act = lambda d: dk.set_activity(tid, d)
+    act("Diagnosing the failure to choose the right recovery")
+    tr = run_claude(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
+                    allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
+                    permission_mode="default", max_turns=10, max_budget_usd=1.0,
+                    on_activity=act)
+    if tr["is_error"]:
+        # Couldn't even diagnose — give it another whole pass rather than stalling.
+        return _recover_or_stall(tid, f"{phase} failed (triage unavailable): {failure[:160]}",
+                                 transient=True)
+    verdict, detail = parse_verdict(tr["text"], "TRIAGE")
+    dk.add_event(tid, "note", actor="agent",
+                 summary=(f"**Recovery triage** — failed at *{phase}*. "
+                          f"Diagnosis: **{verdict or 'BLOCKED'}**"
+                          + (f"\n\n{detail}" if detail else "")
+                          + f"\n\n_Reasoning:_ {_strip_control(tr['text'])[:600]}"),
+                 payload={"cost_usd": tr["cost"], "turns": tr["turns"]})
+    if verdict == "RETRY":
+        return _recover_or_stall(tid, f"{phase} failed: {failure[:160]}", transient=True)
+    if verdict == "NEEDS_INFO":
+        return _to_needs_info(t, detail, phase=phase)
+    # BLOCKED, or a garbled/empty verdict → human-gated stall with the diagnosis.
+    return _stall(tid, f"{phase} blocked: {(detail or failure)[:300]}")
+
+
+def process_ticket(t: dict) -> None:
+    tid = t["id"]
+    log(f"Picking up {t['ref']} — {t['title']!r} (priority {t['priority']})")
+    act = lambda d: dk.set_activity(tid, d)
+
+    try:
+        workdir, _branch = workdir_for(t)
+    except subprocess.CalledProcessError as e:
+        return _stall(tid, f"worktree setup failed: {e.stderr or e}")
+
+    # --- Assessment (read-only) ---
+    dk.transition(tid, "assessment", actor="agent", summary="Picked up by the agent")
+    act("Reading the codebase to assess the request")
+    a = run_phase(assess_prompt(t), workdir, allowed_tools=READONLY_TOOLS,
+                  disallowed_tools=["Edit", "Write"], permission_mode="default",
+                  max_turns=15, max_budget_usd=1.5, label="assessment", on_activity=act)
+    if a["is_error"]:
+        return recover(t, "assessment", a["text"], wt=workdir)
+    verdict, questions = parse_verdict(a["text"], "VERDICT")
+    dk.add_event(tid, "assessment", summary=_strip_control(a["text"]), actor="agent",
+                 payload={"cost_usd": a["cost"], "turns": a["turns"], "duration_secs": a["duration"]})
+    log(f"  assessment done (verdict={verdict or 'PROCEED'}, ${a['cost']:.3f}, {a['turns']} turns)")
+
+    # Follow-up detection: the agent explored the codebase, so its RELATED call
+    # is trusted (confirmed link) — the shipped ticket's fix didn't stick.
+    rel, rel_why = parse_verdict(a["text"], "RELATED")
+    rel_m = _re.search(r"(\d+)", rel or "")
+    if rel_m:
+        tgt = int(rel_m.group(1))
+        try:
+            if any(s["id"] == tgt for s in dk.shipped_tickets()):
+                ln = dk.add_link(tid, tgt, source="agent", status="confirmed",
+                                 note=(rel_why or "")[:300])
+                if ln:
+                    dk.add_event(tid, "note", actor="agent",
+                                 summary=f"Assessment links this to shipped DKT-{tgt}"
+                                         f"{': ' + rel_why if rel_why else ''} — counts "
+                                         f"against DKT-{tgt}'s post-ship health.")
+                    log(f"  related → DKT-{tgt} ({rel_why[:80] if rel_why else 'follow-up'})")
+        except Exception as e:
+            log(f"  (related-link failed: {e})")
+
+    # Hybrid grooming gate: bounce vague P0/P1; best-effort the rest.
+    if verdict == "NEEDS_INFO" and t["priority"] in ("P0", "P1"):
+        q = questions or "The requester needs to clarify the ask before work can start."
+        dk.add_event(tid, "comment", summary=f"Needs clarification: {q}", actor="agent")
+        dk.transition(tid, "needs_info", actor="agent",
+                      summary="Bounced for clarification (grooming gate)")
+        dk.enqueue_notification(tid, t.get("created_by") or _notify_default(), "needs_info",
+                                subject=f"Docket {t['ref']}: needs your input",
+                                body=q)
+        log(f"  → Needs Info (bounced): {q}")
+        return
+    if verdict == "NEEDS_INFO":
+        dk.add_event(tid, "note", actor="agent",
+                     summary="Ask is a bit vague but low-priority — proceeding best-effort "
+                             f"with assumptions. Open question: {questions or 'n/a'}")
+
+    # --- Planning (read-only) ---
+    dk.transition(tid, "planning", actor="agent")
+    act("Drafting an implementation plan")
+    p = run_phase(plan_prompt(t, a["text"]), workdir, allowed_tools=READONLY_TOOLS,
+                  disallowed_tools=["Edit", "Write"], permission_mode="default",
+                  max_turns=20, max_budget_usd=1.5, label="planning", on_activity=act)
+    if p["is_error"]:
+        return recover(t, "planning", p["text"], wt=workdir)
+    dk.add_event(tid, "plan", summary=p["text"], actor="agent",
+                 payload={"cost_usd": p["cost"], "turns": p["turns"], "duration_secs": p["duration"]})
+    log(f"  plan done (${p['cost']:.3f}, {p['turns']} turns)")
+
+    if not WRITES_ENABLED:
+        act("Plan ready — autonomous code-gen is disabled")
+        dk.add_event(tid, "note", actor="agent",
+                     summary="Assessment + plan complete. Autonomous code generation is "
+                             "disabled (set DOCKET_AGENT_WRITES=1 to let the agent "
+                             "implement, self-review and open a PR). Parked at Planning.")
+        log(f"  writes disabled — parked {t['ref']} at Planning")
+        return
+
+    # --- In Development + Self-Review: a REAL, bounded corrective loop ---
+    # The agent implements, reviews its own work, and — crucially — gets up to
+    # MAX_DEV_PASSES attempts to ACT on what the review found before giving up.
+    # The old code promised "one corrective loop" but stalled on the first FAIL
+    # without ever re-running development; that single bug stalled most tickets.
+    wt, branch = ensure_worktree(t)
+    dk.transition(tid, "in_development", actor="agent")
+    fix_feedback = ""
+    pr_body = ""
+    passed = False
+    for attempt in range(1, MAX_DEV_PASSES + 1):
+        # DEFECT escalation: if the default model couldn't pass its own review,
+        # corrective passes use the stronger model — more capability aimed exactly
+        # at the bug, rather than re-running the same model that just failed.
+        pass_model = STRONG_MODEL if attempt >= 2 else None
+        if attempt == 1:
+            act("Implementing the change")
+            impl_prompt = implement_prompt(t, p["text"])
+        else:
+            act(f"Addressing self-review feedback (pass {attempt}/{MAX_DEV_PASSES}, {STRONG_MODEL})")
+            impl_prompt = reimplement_prompt(t, p["text"], fix_feedback)
+        i = run_phase(impl_prompt, wt, allowed_tools=WRITE_TOOLS,
+                      permission_mode="acceptEdits", max_turns=40, max_budget_usd=5.0,
+                      model=pass_model, label="implementation", on_activity=act)
+        if i["is_error"]:
+            return recover(t, "implementation", i["text"], wt=wt)
+        label = "**Implemented**" if attempt == 1 else f"**Revised (pass {attempt})**"
+        dk.add_event(tid, "note", summary=f"{label}\n\n" + i["text"][:1500], actor="agent",
+                     payload={"cost_usd": i["cost"], "turns": i["turns"], "duration_secs": i["duration"]})
+        # Commit anything this pass produced.
+        _git(wt, ["add", "-A"])
+        if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode != 0:
+            staged_stat = subprocess.run(
+                ["git", "-C", str(wt), "diff", "--cached", "--stat"],
+                capture_output=True, text=True).stdout
+            _git(wt, ["commit", "-m", f"DKT-{tid}: {t['title']}",
+                      "-m", _pr_summary(t, i["text"], staged_stat),
+                      "-m", "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"])
+        # The real "did this ticket produce work?" measure is the whole branch vs
+        # the base branch — NOT just this run's staged edits. A requeued ticket
+        # whose fix was already committed on its branch in a prior pass makes no
+        # *new* edits yet is NOT a no-op. Only an empty branch is.
+        files_stat = subprocess.run(
+            ["git", "-C", str(wt), "diff", "--stat", BASE_BRANCH, "HEAD"],
+            capture_output=True, text=True).stdout
+        if not files_stat.strip():
+            # Truly nothing on the branch. Route through triage: a real no-op
+            # usually means the agent couldn't locate the change or the ask is
+            # underspecified → NEEDS_INFO, not a dead-end stall.
+            why = ("the implementation phase produced no changes — the branch is identical "
+                   f"to {BASE_BRANCH}. The agent could not determine what to change — typically "
+                   "the ask lacks a concrete repro, exact location, or expected behaviour."
+                   if attempt == 1 else
+                   f"the corrective pass made no edits despite self-review feedback: {fix_feedback[:200]}")
+            return recover(t, "implementation (no changes produced)", why, wt=wt)
+        pr_body = _pr_summary(t, i["text"], files_stat)
+
+        # --- Self-Review (writes on, so it can also make small fixes itself) ---
+        dk.transition(tid, "self_review", actor="agent")
+        act("Reviewing its own work + running checks")
+        r = run_phase(review_prompt(t), wt, allowed_tools=WRITE_TOOLS,
+                      permission_mode="acceptEdits", max_turns=25, max_budget_usd=3.0,
+                      label="self-review", on_activity=act)
+        if r["is_error"]:
+            return recover(t, "self-review", r["text"], wt=wt, diff_summary=files_stat)
+        # The reviewer may have edited files; fold any such fixes into the commit.
+        _git(wt, ["add", "-A"])
+        if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode != 0:
+            _git(wt, ["commit", "--amend", "--no-edit"])
+        dk.add_event(tid, "note", summary="**Self-review**\n\n" + _strip_control(r["text"])[:1500],
+                     actor="agent", payload={"cost_usd": r["cost"], "turns": r["turns"],
+                                             "duration_secs": r["duration"]})
+        rv, fix = parse_verdict(r["text"], "REVIEW")
+        if rv != "FAIL":
+            passed = True
+            break
+        fix_feedback = fix or _strip_control(r["text"])[:600]
+        if attempt < MAX_DEV_PASSES:
+            dk.transition(tid, "in_development", actor="agent",
+                          summary=f"Self-review found issues — iterating (pass {attempt + 1}/{MAX_DEV_PASSES})")
+            log(f"  self-review FAIL, iterating (pass {attempt + 1}): {fix_feedback[:100]}")
+
+    if not passed:
+        # Exhausted the model-escalated corrective loop. Don't just stall —
+        # triage decides whether this is really an underspecified ask (bounce to
+        # the requester) or a genuine blocker (human-gated stall).
+        files_stat = subprocess.run(["git", "-C", str(wt), "diff", "--stat", BASE_BRANCH],
+                                    capture_output=True, text=True).stdout
+        return recover(t, f"self-review (still failing after {MAX_DEV_PASSES} dev passes)",
+                       fix_feedback, wt=wt, diff_summary=files_stat)
+
+    # Record what the change touched — the join key for post-ship telemetry.
+    try:
+        paths, routes = extract_touched(wt)
+        dk.update_ticket(tid, touched_paths=json.dumps(paths),
+                         touched_routes=json.dumps(routes))
+        if routes:
+            log(f"  touched routes: {', '.join(routes[:5])}")
+    except Exception as e:
+        log(f"  (touched extraction failed: {e})")
+
+    # --- Test instructions for the human reviewer (User Review phase) ---
+    act("Writing test instructions for the reviewer")
+    ti = run_claude(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
+                    disallowed_tools=["Edit", "Write"], permission_mode="default",
+                    max_turns=10, max_budget_usd=1.0, on_activity=act)
+    if not ti["is_error"] and ti["text"].strip():
+        dk.update_ticket(tid, test_instructions=_strip_control(ti["text"]))
+
+    # --- PR (push branch + record compare URL; never auto-merge) ---
+    if not PUSH_ENABLED:
+        dk.update_ticket(tid, branch=branch)
+        dk.add_event(tid, "note", actor="agent",
+                     summary=f"Local branch '{branch}' ready in {wt} — push is disabled "
+                             "(DOCKET_AGENT_PUSH=0). Inspect the diff, then push manually "
+                             "to open a PR.")
+        dk.transition(tid, "pr", actor="agent", summary="Local branch ready (push held for review)")
+        log(f"  → local branch ready (push held): {branch} @ {wt}")
+        return
+    act("Pushing the branch + opening a PR")
+    pushed = _git(wt, ["push", "-u", REMOTE, branch])
+    if not pushed:
+        return recover(t, "push", "git push failed (network blip or GitHub auth)", wt=wt)
+    ref = dk.get_ticket(tid)["ref"]
+    pr_url = create_pr(branch, f"{ref}: {t['title']}", pr_body)
+    real_pr = bool(pr_url)
+    if not pr_url:  # no token / API failure → compare URL, Neil opens it by hand
+        pr_url = f"https://github.com/{REPO_SLUG}/compare/{BASE_BRANCH}...{branch}?expand=1"
+    dk.update_ticket(tid, branch=branch, pr_url=pr_url)
+    dk.transition(tid, "pr", actor="agent",
+                  summary="Branch pushed; PR opened" if real_pr
+                          else "Branch pushed; PR ready for review")
+    dk.enqueue_notification(tid, _notify_default(), "pr_ready",
+                            subject=f"Docket {ref}: PR ready",
+                            body=pr_url)
+    log(f"  → PR ready: {pr_url}")
+
+    # Auto-merge (opt-in): squash-merge the real PR, then mark the ticket shipped.
+    # Requires a real PR object (token); with only a compare URL it waits at PR.
+    if AUTO_MERGE:
+        num = _pr_number(pr_url)
+        if real_pr and num and merge_pr(num):
+            dk.update_ticket(tid, pr_url=pr_url.split("#")[0])
+            dk.transition(tid, "user_review", actor="agent",
+                          summary=f"PR #{num} auto-merged")
+            dk.transition(tid, "done", actor="agent",
+                          summary=f"Auto-merged & shipped (PR #{num})")
+            log(f"  → DKT-{tid}: PR #{num} auto-merged & shipped")
+        else:
+            log(f"  → DKT-{tid}: auto-merge skipped "
+                f"({'no real PR — needs a GitHub token' if not real_pr else 'merge not allowed/conflicting'})"
+                f"; left at PR for manual merge")
+
+
+_ROUTE_DECOR_RE = _re.compile(
+    r'@(?:router|app)\.(?:get|post|put|patch|delete)\(\s*["\']([^"\']*)["\']')
+_PREFIX_RE = _re.compile(r'APIRouter\([^)]*prefix\s*=\s*["\']([^"\']+)["\']', _re.S)
+
+
+def extract_touched(wt: Path) -> tuple[list, list]:
+    """What the implementation touched: changed files, plus a best-effort list of
+    API route templates (from @router decorators in the changed hunks, resolved
+    against the file's APIRouter prefix). This is the join key that lets platform
+    telemetry measure the shipped feature's real traffic and error rate."""
+    r = subprocess.run(["git", "-C", str(wt), "diff", "--name-only", BASE_BRANCH],
+                       capture_output=True, text=True)
+    paths = [p for p in r.stdout.split() if p]
+    routes: set = set()
+    for p in paths:
+        if not (p.startswith("backend/") and p.endswith(".py")):
+            continue
+        f = wt / p
+        if not f.exists():
+            continue
+        src = f.read_text(errors="ignore")
+        m = _PREFIX_RE.search(src)
+        prefix = m.group(1) if m else ""
+        diff = subprocess.run(["git", "-C", str(wt), "diff", "-U2", BASE_BRANCH, "--", p],
+                              capture_output=True, text=True).stdout
+        found = {prefix + dm.group(1)
+                 for dm in _ROUTE_DECOR_RE.finditer(diff) if prefix + dm.group(1)}
+        if not found:
+            # The change was inside a handler body (decorator outside the diff
+            # context). A bug anywhere in the file can break any of its routes,
+            # so attribute the whole file's routes — capped to stay sane.
+            found = {prefix + dm.group(1)
+                     for dm in _ROUTE_DECOR_RE.finditer(src) if prefix + dm.group(1)}
+            if len(found) > 12:
+                found = set()
+        routes |= found
+    return paths[:100], sorted(routes)[:50]
+
+
+def _git(cwd: Path, args: list) -> bool:
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"  git {' '.join(args[:2])} failed: {r.stderr.strip()[:200]}")
+        return False
+    return True
+
+
+def create_pr(branch: str, title: str, body: str) -> str:
+    """Create a real PR object via the GitHub API when a token is configured.
+    Returns the PR html_url, or '' on any failure / no token (caller falls back
+    to the compare URL). 422 'already exists' resolves to the existing PR."""
+    if not GITHUB_TOKEN:
+        return ""
+    api = f"https://api.github.com/repos/{REPO_SLUG}/pulls"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+               "Accept": "application/vnd.github+json",
+               "Content-Type": "application/json"}
+    payload = json.dumps({"title": title, "head": branch, "base": BASE_BRANCH,
+                          "body": body}).encode()
+    try:
+        req = urllib.request.Request(api, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp).get("html_url", "")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code == 422 and "already exists" in detail:
+            try:  # find the existing open PR for this head
+                q = f"{api}?head={REPO_SLUG.split('/')[0]}:{branch}&state=open"
+                req = urllib.request.Request(q, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    prs = json.load(resp)
+                    if prs:
+                        return prs[0].get("html_url", "")
+            except Exception:
+                pass
+        log(f"  PR creation failed ({e.code}): {detail}")
+    except Exception as e:
+        log(f"  PR creation failed: {e}")
+    return ""
+
+
+def _pr_number(pr_url: str) -> int:
+    """Extract the PR number from a .../pull/<n> URL, or 0 if not a real PR URL
+    (e.g. a compare URL)."""
+    m = _re.search(r"/pull/(\d+)", pr_url or "")
+    return int(m.group(1)) if m else 0
+
+
+def merge_pr(number: int, method: str = "squash") -> bool:
+    """Merge a PR via the GitHub API. Requires a token. Returns True on success;
+    False (with a log line) if not mergeable / conflicting / no token."""
+    if not GITHUB_TOKEN or not number:
+        return False
+    api = f"https://api.github.com/repos/{REPO_SLUG}/pulls/{number}/merge"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+               "Accept": "application/vnd.github+json",
+               "Content-Type": "application/json"}
+    payload = json.dumps({"merge_method": method}).encode()
+    try:
+        req = urllib.request.Request(api, data=payload, headers=headers, method="PUT")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return bool(json.load(resp).get("merged"))
+    except urllib.error.HTTPError as e:
+        log(f"  PR #{number} merge failed ({e.code}): {e.read().decode(errors='replace')[:200]}")
+    except Exception as e:
+        log(f"  PR #{number} merge failed: {e}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Notification delivery (msmtp) — drains the queue the storage layer fills.
+# Stays a graceful no-op until msmtp + an SMTP credential are configured, so
+# notifications simply wait in 'pending' rather than getting lost.
+# ---------------------------------------------------------------------------
+
+def _msmtp_ready() -> bool:
+    return bool(shutil.which("msmtp")) and (
+        Path("/etc/msmtprc").exists() or Path.home().joinpath(".msmtprc").exists())
+
+
+def _send_email(to_addr: str, subject: str, body: str) -> bool:
+    msg = (f"From: {MAIL_FROM}\nTo: {to_addr}\nSubject: {subject}\n"
+           f"Content-Type: text/plain; charset=utf-8\n\n{body}\n")
+    r = subprocess.run(["msmtp", to_addr], input=msg, capture_output=True,
+                       text=True, timeout=60)
+    if r.returncode != 0:
+        log(f"  msmtp failed: {r.stderr.strip()[:200]}")
+    return r.returncode == 0
+
+
+def drain_notifications() -> None:
+    """Send pending notifications via msmtp. Recipients without an email on
+    file are marked 'skipped' (the in-app badge still covers them)."""
+    pending = dk.pending_notifications()
+    if not pending:
+        return
+    if not _msmtp_ready():
+        return  # leave queued; they deliver once msmtp + the SMTP cred land
+    for n in pending:
+        addr = tester_email(n["recipient"])
+        if not addr:
+            dk.mark_notification(n["id"], "skipped")
+            continue
+        subject = n["subject"] or f"Docket: {n['event'].replace('_', ' ')}"
+        ok = _send_email(addr, subject, n["body"] or subject)
+        dk.mark_notification(n["id"], "sent" if ok else "failed")
+        log(f"  notification #{n['id']} → {n['recipient']}: {'sent' if ok else 'FAILED'}")
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Merge reconciler — advance a ticket out of 'pr' once its PR is merged.
+# The agent only pushes a branch + compare URL (no PAT needed); Neil opens and
+# merges the real PR on GitHub. This poll closes the loop: it spots the merge and
+# moves the ticket pr -> user_review so it doesn't sit in PR forever.
+# ---------------------------------------------------------------------------
+
+GH_API = "https://api.github.com"
+# Throttle the GitHub poll: unauthenticated REST is 60 req/hr per IP. 90s = 40/hr
+# worst case (only while a ticket actually sits in 'pr'), leaving headroom while
+# keeping post-merge latency low. With a PAT the limit is 5000/hr — drop this to
+# ~20s via DOCKET_MERGE_POLL for near-instant detection.
+MERGE_POLL_SECS = int(os.environ.get("DOCKET_MERGE_POLL", "90"))
+_last_merge_check = 0.0
+
+
+def _gh_get(path: str):
+    """GitHub REST GET. Unauthenticated works on the public repo; uses
+    GITHUB_TOKEN automatically when present (also lifts the rate limit)."""
+    req = urllib.request.Request(
+        f"{GH_API}{path}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "docket-agent"})
+    if GITHUB_TOKEN:
+        req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
+        log(f"  github poll failed: {e}")
+        return None
+
+
+def reconcile_merged_prs() -> None:
+    """Detect PRs merged on GitHub and advance their tickets pr -> user_review."""
+    global _last_merge_check
+    waiting = [t for t in dk.list_tickets("pr") if t.get("branch")]
+    if not waiting:
+        return
+    now = time.monotonic()
+    if now - _last_merge_check < MERGE_POLL_SECS:
+        return
+    _last_merge_check = now
+    data = _gh_get(f"/repos/{REPO_SLUG}/pulls?state=closed&base={BASE_BRANCH}"
+                   "&per_page=50&sort=updated&direction=desc")
+    if not isinstance(data, list):
+        return
+    merged = {pr["head"]["ref"]: pr for pr in data
+              if pr.get("merged_at") and pr.get("head", {}).get("ref")}
+    for t in waiting:
+        pr = merged.get(t["branch"])
+        if not pr:
+            continue
+        tid = t["id"]
+        try:
+            dk.update_ticket(tid, pr_url=pr.get("html_url") or t.get("pr_url"))
+            dk.transition(tid, "user_review", actor="github",
+                          summary=f"PR #{pr['number']} merged on GitHub — ready to test")
+            dk.enqueue_user_review_notification(dk.get_ticket(tid))
+            log(f"  → DKT-{tid}: PR #{pr['number']} merged → user_review")
+        except ValueError as e:
+            log(f"  merge reconcile skipped DKT-{tid}: {e}")
+
+
+def run_once() -> bool:
+    """Work the single highest-priority queued ticket. Returns True if one ran."""
+    t = dk.next_in_queue()
+    if not t:
+        return False
+    try:
+        process_ticket(t)
+    except Exception as e:
+        _stall(t["id"], f"unexpected error: {e}")
+    return True
+
+
+def main() -> int:
+    once = "--once" in sys.argv
+    log(f"starting (writes={'ON' if WRITES_ENABLED else 'OFF'}, model={MODEL}, "
+        f"once={once})")
+    for r in dk.requeue_stuck_agent_tickets():
+        log(f"resumed DKT-{r['id']} (was {r['from']}) -> queued")
+    if once:
+        ran = run_once()
+        log("worked one ticket" if ran else "queue empty")
+        return 0
+    while True:
+        try:
+            reconcile_merged_prs()
+            drain_notifications()
+            if not run_once():
+                time.sleep(POLL_SECS)
+        except KeyboardInterrupt:
+            log("stopping")
+            return 0
+        except Exception as e:
+            log(f"loop error: {e}")
+            time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

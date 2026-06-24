@@ -1,0 +1,1 @@
+recursive-include src/docket_dev/web/dist *

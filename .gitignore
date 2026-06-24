@@ -1,0 +1,12 @@
+# Build outputs at the package root only (anchored so they don't match web/dist).
+/build/
+/dist/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# DO ship the prebuilt React bundle — it's a build input for the wheel and lets
+# `pipx install` work without a frontend toolchain. This overrides the repo-root
+# .gitignore's global `dist/` rule.
+!src/docket_dev/web/dist/
+!src/docket_dev/web/dist/**
