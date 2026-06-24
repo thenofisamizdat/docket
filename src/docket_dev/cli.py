@@ -384,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--user", help="login username (default: git user.name)")
     pi.add_argument("--email", help="login email (default: git user.email)")
     pi.add_argument("--password", help="login password (default: testing)")
-    pi.add_argument("--model", default="sonnet", help="agent model (default: sonnet)")
+    pi.add_argument("--model", default="opus", help="agent model (default: opus)")
     pi.add_argument("--no-writes", action="store_true", help="grooming only (no code-gen)")
     pi.add_argument("--no-push", action="store_true", help="implement + commit locally but hold the push for inspection")
     pi.add_argument("--no-recognize", action="store_true", help="skip codebase recognition")
