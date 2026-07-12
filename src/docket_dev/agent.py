@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -332,10 +333,38 @@ def workdir_for(ticket: dict) -> tuple[Path, str | None]:
 # ---------------------------------------------------------------------------
 
 def _ctx(t: dict) -> str:
-    return (f"Ticket {t['ref']} ({t['type']}, priority {t['priority']}):\n"
+    base = (f"Ticket {t['ref']} ({t['type']}, priority {t['priority']}):\n"
             f"TITLE: {t['title']}\n"
             f"DESCRIPTION: {t.get('description') or '(none)'}\n"
             f"ACCEPTANCE CRITERIA: {t.get('acceptance_criteria') or '(none)'}\n")
+    return base + _prior_rejections_ctx(t)
+
+
+def _prior_rejections_ctx(t: dict) -> str:
+    """When a ticket has bounced (iteration > 0), the requester already tested a
+    shipped fix and REJECTED it. Surface their rejection feedback so the agent
+    stops re-shipping the same broken approach — the single biggest cause of the
+    repeat-resubmit loop. We pull the requester's own words from the timeline
+    (human comments + resubmit reasons), most recent last."""
+    it = int(t.get("iteration") or 0)
+    if it <= 0:
+        return ""
+    try:
+        events = dk.get_events(t["id"])
+    except Exception:
+        events = []
+    human = [e for e in events
+             if e.get("kind") in ("comment", "resubmit")
+             and (e.get("actor") or "").lower() not in ("agent", "system", "")]
+    notes = "\n".join(f"  - {(e.get('summary') or '').strip()[:300]}" for e in human[-4:])
+    return (
+        f"\n⚠ THIS IS ATTEMPT #{it + 1}. Earlier agent attempts shipped a fix that the "
+        f"requester TESTED and REJECTED. Repeating the same approach will fail again.\n"
+        + (f"What the requester says is STILL wrong (their words):\n{notes}\n" if notes else "")
+        + "Before coding: re-derive — from the requester's description — the EXACT UI "
+          "surface/route/component they are using. A prior attempt may have changed the "
+          "WRONG place. If your plan looks like the last one, change the approach.\n"
+    )
 
 
 def _repo_profile() -> str:
@@ -435,11 +464,34 @@ def test_instructions_prompt(t: dict) -> str:
 
 def review_prompt(t: dict) -> str:
     return (
-        "You are the self-review phase. Review the uncommitted changes in this "
-        "worktree against the ticket's acceptance criteria. Run any quick checks "
-        "you can (compile/lint/tests). Report problems found and whether the work "
-        "is ready.\n\n" + _ctx(t) +
-        "\nEnd with EXACTLY ONE final line: 'REVIEW: PASS' or 'REVIEW: FAIL || <what to fix>'."
+        "You are an INDEPENDENT reviewer — NOT the engineer who wrote this code, "
+        "and you do not trust their summary. Your DEFAULT verdict is FAIL. You may "
+        "only PASS work you have PROVEN meets the acceptance criteria by EXECUTING "
+        "a check that reproduces the ticket's ACTUAL scenario. Reading the diff and "
+        "reasoning that it 'should' work, or 'verifying the logic by hand', is NOT "
+        "acceptable and must be UNVERIFIED, never PASS.\n\n"
+        "Do this, in order:\n"
+        "1. Restate the acceptance criteria as concrete, observable outcomes.\n"
+        "2. If this is a BUG: first REPRODUCE the reported broken behaviour — write "
+        "and RUN a small script/test that exercises the exact inputs in the "
+        "description (e.g. the specific dates/values the requester gave). Show it "
+        "now produces the correct result, and that a neighbouring correct case "
+        "still works. Quote the command(s) you ran and their real output.\n"
+        "3. Also run whatever compile/lint/build/tests exist — but treat those as "
+        "NECESSARY, NOT SUFFICIENT: they prove the code runs, not that the bug is "
+        "fixed.\n"
+        "4. Sanity-check you changed the RIGHT surface — does the file you edited "
+        "actually back the UI/flow the requester described? If you can't tell, that "
+        "is a reason to NOT pass.\n"
+        "5. If the fix genuinely cannot be exercised in this worktree (needs a live "
+        "service/data you don't have), say so plainly — that is UNVERIFIED.\n\n"
+        + _ctx(t) +
+        "\nEnd with EXACTLY ONE final line:\n"
+        "  REVIEW: PASS  — ONLY if you executed a check reproducing the ticket "
+        "scenario and observed the acceptance criteria met (command + output shown above).\n"
+        "  REVIEW: UNVERIFIED || <why it couldn't be executed here, AND the exact "
+        "step-by-step a human must run to test it> — change looks plausible but is NOT proven.\n"
+        "  REVIEW: FAIL || <the specific defect to fix> — you found a concrete problem."
     )
 
 
@@ -716,14 +768,19 @@ def process_ticket(t: dict) -> None:
     # without ever re-running development; that single bug stalled most tickets.
     wt, branch = ensure_worktree(t)
     dk.transition(tid, "in_development", actor="agent")
+    iteration = int(t.get("iteration") or 0)
     fix_feedback = ""
     pr_body = ""
     passed = False
+    verified = False          # True only on an EXECUTED, evidence-backed PASS
+    unverified_reason = ""    # set when the reviewer returns UNVERIFIED
     for attempt in range(1, MAX_DEV_PASSES + 1):
         # DEFECT escalation: if the default model couldn't pass its own review,
         # corrective passes use the stronger model — more capability aimed exactly
-        # at the bug, rather than re-running the same model that just failed.
-        pass_model = STRONG_MODEL if attempt >= 2 else None
+        # at the bug, rather than re-running the same model that just failed. A
+        # resubmit (iteration > 0) means a prior shipped fix was rejected, so we
+        # start on the stronger model immediately rather than re-earning the bug.
+        pass_model = STRONG_MODEL if (attempt >= 2 or iteration >= 1) else None
         if attempt == 1:
             act("Implementing the change")
             impl_prompt = implement_prompt(t, p["text"])
@@ -782,8 +839,18 @@ def process_ticket(t: dict) -> None:
                      actor="agent", payload={"cost_usd": r["cost"], "turns": r["turns"],
                                              "duration_secs": r["duration"]})
         rv, fix = parse_verdict(r["text"], "REVIEW")
-        if rv != "FAIL":
+        if rv == "PASS":
+            # Cleared with executed, evidence-backed verification.
             passed = True
+            verified = True
+            break
+        if rv != "FAIL":
+            # UNVERIFIED (or any non-FAIL, non-PASS verdict): the change is
+            # plausible but the reviewer could NOT prove it here. Ship it for a
+            # human test, but HONESTLY — flagged unverified, never claimed done.
+            passed = True
+            verified = False
+            unverified_reason = fix or _strip_control(r["text"])[:600]
             break
         fix_feedback = fix or _strip_control(r["text"])[:600]
         if attempt < MAX_DEV_PASSES:
@@ -810,13 +877,39 @@ def process_ticket(t: dict) -> None:
     except Exception as e:
         log(f"  (touched extraction failed: {e})")
 
+    # --- Verification status: be HONEST about whether the agent proved the fix.
+    # The whole point of the hardened gate is that "done" must mean verified;
+    # an unproven change still goes for human test, but clearly labelled so the
+    # reviewer knows to reproduce the original problem themselves. ---
+    if verified:
+        dk.add_event(tid, "note", actor="agent",
+                     summary="✅ Verified — the reviewer reproduced the ticket scenario "
+                             "and observed the acceptance criteria met.")
+    else:
+        dk.add_event(tid, "note", actor="agent",
+                     summary="⚠️ NOT verified by the agent — the fix could not be "
+                             "reproduced in the worktree. Needs a human test against the "
+                             "real app." + (f" Reason: {unverified_reason[:400]}"
+                                            if unverified_reason else ""))
+
     # --- Test instructions for the human reviewer (User Review phase) ---
     act("Writing test instructions for the reviewer")
     ti = run_claude(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
                     disallowed_tools=["Edit", "Write"], permission_mode="default",
                     max_turns=10, max_budget_usd=1.0, on_activity=act)
     if not ti["is_error"] and ti["text"].strip():
-        dk.update_ticket(tid, test_instructions=_strip_control(ti["text"]))
+        instructions = _strip_control(ti["text"])
+        if not verified:
+            banner = (
+                "> ⚠️ **The agent could NOT verify this fix** — it was not reproduced "
+                "in an automated check. Please reproduce the ORIGINAL problem first, "
+                "then confirm these steps actually resolve it.\n"
+                + (f">\n> _Why it couldn't be auto-verified:_ {unverified_reason[:300]}\n"
+                   if unverified_reason else "")
+                + "\n---\n\n"
+            )
+            instructions = banner + instructions
+        dk.update_ticket(tid, test_instructions=instructions)
 
     # --- PR (push branch + record compare URL; never auto-merge) ---
     if not PUSH_ENABLED:
@@ -841,10 +934,13 @@ def process_ticket(t: dict) -> None:
     dk.transition(tid, "pr", actor="agent",
                   summary="Branch pushed; PR opened" if real_pr
                           else "Branch pushed; PR ready for review")
+    vstatus = ("✅ Agent-verified (reproduced the fix)." if verified
+               else "⚠️ NOT agent-verified — reproduce the original problem when testing.")
     dk.enqueue_notification(tid, _notify_default(), "pr_ready",
-                            subject=f"Docket {ref}: PR ready",
-                            body=pr_url)
-    log(f"  → PR ready: {pr_url}")
+                            subject=f"Docket {ref}: PR ready"
+                                    + ("" if verified else " (unverified)"),
+                            body=f"{vstatus}\n\n{pr_url}")
+    log(f"  → PR ready ({'verified' if verified else 'UNVERIFIED'}): {pr_url}")
 
     # Auto-merge (opt-in): squash-merge the real PR, then mark the ticket shipped.
     # Requires a real PR object (token); with only a compare URL it waits at PR.
@@ -1048,6 +1144,27 @@ def _gh_get(path: str):
         return None
 
 
+def _branch_head_sha(branch: str) -> str:
+    """Current tip SHA of `branch` on origin, via the GitHub API. Returns '' if
+    the branch is gone (deleted after merge) or the lookup fails — callers treat
+    an unknown tip as 'nothing to compare against', i.e. no post-merge drift."""
+    data = _gh_get(f"/repos/{REPO_SLUG}/branches/"
+                   f"{urllib.parse.quote(branch, safe='/')}")
+    if isinstance(data, dict):
+        return (data.get("commit") or {}).get("sha") or ""
+    return ""
+
+
+def _flagged_incomplete_tip(tid: int) -> str:
+    """The branch tip we've already warned about for this ticket's incomplete
+    merge, if any — so the poll alerts once per new tip, not every cycle."""
+    for e in reversed(dk.get_events(tid)):
+        p = e.get("payload")
+        if isinstance(p, dict) and p.get("merge_incomplete"):
+            return p.get("branch_tip") or ""
+    return ""
+
+
 def reconcile_merged_prs() -> None:
     """Detect PRs merged on GitHub and advance their tickets pr -> user_review."""
     global _last_merge_check
@@ -1062,13 +1179,55 @@ def reconcile_merged_prs() -> None:
                    "&per_page=50&sort=updated&direction=desc")
     if not isinstance(data, list):
         return
-    merged = {pr["head"]["ref"]: pr for pr in data
-              if pr.get("merged_at") and pr.get("head", {}).get("ref")}
+    # Most-recently-merged PR per head branch (a branch can be reused across a
+    # user-review bounce, opening a second PR — take the latest merge).
+    merged: dict = {}
+    for pr in data:
+        ref = (pr.get("head") or {}).get("ref")
+        if not (pr.get("merged_at") and ref):
+            continue
+        prev = merged.get(ref)
+        if prev is None or pr["merged_at"] > prev["merged_at"]:
+            merged[ref] = pr
     for t in waiting:
         pr = merged.get(t["branch"])
         if not pr:
             continue
         tid = t["id"]
+
+        # Guard: did the branch keep moving AFTER the PR merged? GitHub freezes a
+        # merged PR's head.sha at merge time; if the branch's live tip differs,
+        # commit(s) landed post-merge and are NOT on main — the classic "PR merged
+        # before the real fix commit landed" (DKT-42). Don't advance to
+        # user_review over an incomplete merge: hold at the PR gate and alert so a
+        # human re-merges, rather than testing a main that lacks the fix. This is
+        # a SHA-identity check (not ancestry), so it's correct for squash/rebase/
+        # merge alike.
+        merged_sha = (pr.get("head") or {}).get("sha") or ""
+        tip = _branch_head_sha(t["branch"])
+        if merged_sha and tip and tip != merged_sha:
+            if _flagged_incomplete_tip(tid) != tip:
+                dk.add_event(
+                    tid, "note", actor="github",
+                    summary=(f"⚠ Incomplete merge: PR #{pr['number']} merged at "
+                             f"{merged_sha[:7]}, but branch `{t['branch']}` has since "
+                             f"advanced to {tip[:7]} — those commit(s) are NOT on main. "
+                             f"Re-merge the branch (or open a fresh PR) before testing; "
+                             f"auto-deploy will then ship it."),
+                    payload={"merge_incomplete": True, "branch_tip": tip,
+                             "merged_sha": merged_sha, "pr": pr["number"]})
+                dk.enqueue_notification(
+                    tid, _notify_default(), "pr_ready",
+                    subject=f"Docket DKT-{tid}: merge INCOMPLETE — branch moved after merge",
+                    body=(f"PR #{pr['number']} was merged at {merged_sha[:7]}, but branch "
+                          f"`{t['branch']}` is now at {tip[:7]}. Commit(s) pushed after the "
+                          f"merge are not on main, so the ticket is NOT actually shipped. "
+                          f"Re-merge the branch before this goes to testing.\n\n"
+                          f"{pr.get('html_url','')}"))
+                log(f"  ⚠ DKT-{tid}: incomplete merge (merged {merged_sha[:7]} "
+                    f"!= tip {tip[:7]}) — held at PR gate")
+            continue  # stay in 'pr' until the branch is fully merged
+
         try:
             dk.update_ticket(tid, pr_url=pr.get("html_url") or t.get("pr_url"))
             dk.transition(tid, "user_review", actor="github",
