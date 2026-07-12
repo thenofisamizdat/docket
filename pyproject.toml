@@ -42,4 +42,4 @@ docket = "docket_dev.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"docket_dev" = ["web/dist/**/*"]
+"docket_dev" = ["web/dist/**/*", "web/roadmap.html"]

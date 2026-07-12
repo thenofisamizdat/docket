@@ -11,10 +11,12 @@ from __future__ import annotations
 from importlib.resources import files
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from docket_dev import storage, telemetry
 from docket_dev.auth import build_login_router
+from docket_dev.roadmap_routes import router as roadmap_router
 from docket_dev.routes import router as docket_router
 
 
@@ -22,12 +24,26 @@ def _dist_dir() -> str:
     return str(files("docket_dev") / "web" / "dist")
 
 
+def _roadmap_page() -> str:
+    return str(files("docket_dev") / "web" / "roadmap.html")
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Docket", docs_url=None, redoc_url=None)
     storage.init_db()
     app.include_router(docket_router)          # /api/tickets/*
+    app.include_router(roadmap_router)         # /api/roadmap/*
     app.include_router(build_login_router())   # /api/testing/login, /api/testing/me
     telemetry.install(app)                     # per-route traffic/error capture (graceful)
+
+    # The roadmap board is a self-contained page (no frontend toolchain needed,
+    # same as shipping the prebuilt SPA). Same-origin, so it shares the
+    # `testing_token` login cookie with the main board.
+    from pathlib import Path as _P
+    if _P(_roadmap_page()).is_file():
+        @app.get("/roadmap", include_in_schema=False)
+        def roadmap_page():
+            return FileResponse(_roadmap_page(), media_type="text/html")
 
     # Mounted last so the API routes above take precedence. html=True serves
     # index.html for the SPA; the bundle is built with base="/docket/". Guarded

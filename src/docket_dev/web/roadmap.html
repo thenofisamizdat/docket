@@ -1,0 +1,416 @@
+<!doctype html>
+<!--
+  Docket Roadmap — the 5-week waterfall board.
+
+  A single self-contained page (no build step, matching how Docket ships its
+  UI) served at /roadmap by app.py. Talks to /api/roadmap/* and shares the
+  tester login with the main board (Bearer token, mirrored into the
+  `testing_token` cookie the backend also accepts).
+
+  Layout: Acklog | Week 1..N | Done, with an always-visible hours-to-completion
+  counter and a burndown that reacts to bumps, scope injection, and completions.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docket — Roadmap</title>
+<style>
+  :root{
+    --bg:#0e1117; --panel:#161b24; --panel2:#1c2330; --line:#2a3345;
+    --text:#e6ebf4; --dim:#8b96ab; --accent:#4f8cff; --ok:#3fb96a;
+    --warn:#e0a83c; --bad:#e05252; --bump:#c069e8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{display:flex;align-items:center;gap:18px;padding:14px 20px;
+         border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+  header h1 span{color:var(--accent)}
+  .cycle-info{color:var(--dim);font-size:12.5px}
+  .spacer{flex:1}
+  .counter{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+           padding:7px 14px;text-align:center;min-width:118px}
+  .counter b{display:block;font-size:20px;font-weight:700}
+  .counter small{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px}
+  .counter.remaining b{color:var(--warn)}
+  .counter.scope b{color:var(--accent)}
+  .counter.done b{color:var(--ok)}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+         border-radius:8px;padding:7px 12px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  #chartWrap{padding:10px 20px 0}
+  #chartBox{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+            padding:10px 14px 4px}
+  #chartBox h3{margin:0 0 2px;font-size:12px;color:var(--dim);font-weight:600;
+               text-transform:uppercase;letter-spacing:.6px}
+  canvas{width:100%;height:150px;display:block}
+  .legend{display:flex;gap:16px;font-size:11.5px;color:var(--dim);padding:4px 2px 6px}
+  .key{display:inline-block;width:18px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+
+  #board{display:flex;gap:10px;padding:14px 20px 24px;overflow-x:auto;align-items:flex-start}
+  .lane{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        min-width:230px;width:230px;flex:0 0 auto;display:flex;flex-direction:column;max-height:calc(100vh - 320px)}
+  .lane.current{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .lane.dragover{background:var(--panel2);border-color:var(--accent)}
+  .lane-head{padding:10px 12px 8px;border-bottom:1px solid var(--line)}
+  .lane-head .t{font-weight:650;font-size:13px}
+  .lane-head .d{color:var(--dim);font-size:11px;margin-top:1px;display:flex;gap:8px;flex-wrap:wrap}
+  .lane-head .now{color:var(--accent);font-weight:600}
+  .cards{padding:8px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;min-height:60px}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+        padding:8px 10px;cursor:grab}
+  .card:active{cursor:grabbing}
+  .card .ref{font-size:10.5px;color:var(--dim);display:flex;justify-content:space-between;align-items:center}
+  .card .title{font-size:12.8px;margin:3px 0 6px;font-weight:550}
+  .card .meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:10.5px}
+  .pill{border-radius:20px;padding:1px 8px;border:1px solid var(--line);color:var(--dim)}
+  .pill.P0{color:#fff;background:var(--bad);border-color:var(--bad)}
+  .pill.P1{color:var(--bad);border-color:var(--bad)}
+  .pill.P2{color:var(--warn);border-color:var(--warn)}
+  .pill.status{color:var(--dim)}
+  .pill.status.done{color:var(--ok);border-color:var(--ok)}
+  .pill.bump{color:var(--bump);border-color:var(--bump);font-weight:700}
+  .hours{margin-left:auto;font-weight:650;font-size:11.5px;cursor:pointer;color:var(--text)}
+  .hours:hover{color:var(--accent)}
+  .hours .rem{color:var(--warn)}
+  .card.done-card{opacity:.75}
+  .empty{color:var(--dim);font-size:11.5px;text-align:center;padding:14px 4px}
+
+  /* overlays */
+  .overlay{position:fixed;inset:0;background:rgba(8,10,15,.78);display:flex;
+           align-items:center;justify-content:center;z-index:50}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+         padding:26px;width:330px}
+  .modal h2{margin:0 0 14px;font-size:16px}
+  .modal label{display:block;color:var(--dim);font-size:11.5px;margin:10px 0 4px;
+               text-transform:uppercase;letter-spacing:.5px}
+  .modal input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);
+               border-radius:8px;padding:8px 10px;font-size:13.5px}
+  .modal .err{color:var(--bad);font-size:12px;min-height:16px;margin-top:8px}
+  .modal button{width:100%;margin-top:12px}
+  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
+         background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+         padding:9px 16px;font-size:13px;display:none;z-index:60}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Docket <span>Roadmap</span></h1>
+  <div class="cycle-info" id="cycleInfo">—</div>
+  <div class="spacer"></div>
+  <div class="counter remaining"><b id="hoursLeft">–</b><small>hrs to completion</small></div>
+  <div class="counter scope"><b id="scopeTotal">–</b><small>hrs committed</small></div>
+  <div class="counter done"><b id="hoursDone">–</b><small>hrs done</small></div>
+  <button id="rolloverBtn" title="Bump everything unfinished in expired weeks into the current week">Roll over week</button>
+  <button id="cycleBtn">New cycle…</button>
+</header>
+
+<div id="chartWrap">
+  <div id="chartBox">
+    <h3>Burndown</h3>
+    <canvas id="burndown" height="150"></canvas>
+    <div class="legend">
+      <span><i class="key" style="background:var(--dim)"></i>Ideal</span>
+      <span><i class="key" style="background:var(--warn)"></i>Remaining</span>
+      <span><i class="key" style="background:var(--accent);height:2px;border-bottom:2px dashed var(--accent);background:none"></i>Scope</span>
+      <span><i class="key" style="background:var(--bump)"></i>Bumps (ticks)</span>
+    </div>
+  </div>
+</div>
+
+<div id="board"></div>
+<div id="toast"></div>
+
+<!-- login -->
+<div class="overlay" id="loginOverlay" style="display:none">
+  <form class="modal" id="loginForm">
+    <h2>Sign in to Docket</h2>
+    <label>Username</label><input id="lu" autocomplete="username">
+    <label>Password</label><input id="lp" type="password" autocomplete="current-password">
+    <div class="err" id="loginErr"></div>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+</div>
+
+<!-- new cycle -->
+<div class="overlay" id="cycleOverlay" style="display:none">
+  <form class="modal" id="cycleForm">
+    <h2>Start a cycle</h2>
+    <label>Name</label><input id="cn" placeholder="Alpha push">
+    <label>Start date (Monday)</label><input id="cs" type="date">
+    <label>Weeks</label><input id="cw" type="number" value="5" min="1" max="12">
+    <div class="err" id="cycleErr"></div>
+    <button class="primary" type="submit">Create — lanes reset to Acklog</button>
+    <button type="button" id="cycleCancel">Cancel</button>
+  </form>
+</div>
+
+<script>
+"use strict";
+let TOKEN = null, BOARD = null;
+
+/* ---------------- api ---------------- */
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({"Content-Type": "application/json"},
+    TOKEN ? {"Authorization": "Bearer " + TOKEN} : {}, opts.headers || {});
+  const r = await fetch(path, opts);
+  if (r.status === 401) { showLogin(); throw new Error("auth"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+
+/* ---------------- auth ---------------- */
+function showLogin(){ document.getElementById("loginOverlay").style.display="flex"; }
+document.getElementById("loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    const d = await api("/api/testing/login", {method:"POST", body:JSON.stringify({
+      username: document.getElementById("lu").value,
+      password: document.getElementById("lp").value })});
+    TOKEN = d.token;
+    // Mirror into the cookie the backend also accepts, so refreshes stay signed in.
+    document.cookie = "testing_token=" + TOKEN + "; path=/; max-age=" + 7*24*3600 + "; samesite=lax";
+    document.getElementById("loginOverlay").style.display = "none";
+    load();
+  } catch(err){ document.getElementById("loginErr").textContent = "Invalid username or password"; }
+});
+(function bootToken(){
+  const m = document.cookie.match(/(?:^|;\s*)testing_token=([^;]+)/);
+  if (m) TOKEN = m[1];
+})();
+
+/* ---------------- load + render ---------------- */
+async function load(){
+  try { BOARD = await api("/api/roadmap"); } catch(e){ return; }
+  render();
+}
+
+function fmtH(x){ return (x === null || x === undefined) ? "–" : (Math.round(x*10)/10) + "h"; }
+function toast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600);
+}
+
+function laneSum(cards){
+  let est = 0, rem = 0;
+  for (const c of cards){ est += c.estimate_hours || 0; rem += c.effective_remaining || 0; }
+  return {est, rem};
+}
+
+function render(){
+  const b = BOARD, cyc = b.cycle;
+  document.getElementById("cycleInfo").textContent = cyc
+    ? `${cyc.name || "Cycle"} · ${cyc.start_date} → +${cyc.weeks}w · ` +
+      (b.current_week === 0 ? "not started" :
+       b.current_week > cyc.weeks ? "cycle ended" : `week ${b.current_week} of ${cyc.weeks}`)
+    : "No cycle yet — start one to plan weeks.";
+  const doneH = b.lanes.done.reduce((s,t) => s + (t.estimate_hours || 0), 0);
+  document.getElementById("hoursLeft").textContent  = fmtH(b.hours_to_completion);
+  document.getElementById("scopeTotal").textContent = fmtH(b.total_scope);
+  document.getElementById("hoursDone").textContent  = fmtH(doneH);
+
+  const board = document.getElementById("board");
+  board.innerHTML = "";
+  board.appendChild(lane("backlog", "Acklog", "unscheduled", b.lanes.backlog, false));
+  for (const w of (b.weeks || [])){
+    const cards = b.lanes["w" + w.week] || [];
+    const s = laneSum(cards);
+    const bumpsIn = cards.reduce((n,c) => n + (c.bump_count ? 1 : 0), 0);
+    const sub = `${w.start.slice(5)}→${w.end.slice(5)} · ${fmtH(s.rem)} open` +
+                (bumpsIn ? ` · ↻${bumpsIn}` : "");
+    board.appendChild(lane("w" + w.week, "Week " + w.week, sub, cards, w.is_current));
+  }
+  board.appendChild(lane("done", "Done", fmtH(doneH) + " shipped", b.lanes.done, false));
+  drawBurndown();
+}
+
+function lane(id, title, sub, cards, isCurrent){
+  const el = document.createElement("div");
+  el.className = "lane" + (isCurrent ? " current" : "");
+  el.dataset.lane = id;
+  el.innerHTML = `<div class="lane-head"><div class="t">${title}</div>
+    <div class="d">${isCurrent ? '<span class="now">current</span> · ' : ""}${sub}</div></div>`;
+  const wrap = document.createElement("div"); wrap.className = "cards";
+  if (!cards.length) wrap.innerHTML = `<div class="empty">empty</div>`;
+  for (const t of cards) wrap.appendChild(card(t, id));
+  el.appendChild(wrap);
+  if (id !== "done"){        // Done is lifecycle-driven, not drag-driven
+    el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("dragover"); });
+    el.addEventListener("dragleave", () => el.classList.remove("dragover"));
+    el.addEventListener("drop", e => { e.preventDefault(); el.classList.remove("dragover"); onDrop(e, id); });
+  }
+  return el;
+}
+
+function card(t, laneId){
+  const el = document.createElement("div");
+  el.className = "card" + (t.status === "done" ? " done-card" : "");
+  el.draggable = laneId !== "done" && t.status !== "done";
+  el.dataset.id = t.id;
+  const hrs = t.estimate_hours != null
+    ? `<span class="hours" title="click to edit hours">${fmtH(t.estimate_hours)}` +
+      (t.status === "done" ? "" : ` · <span class="rem">${fmtH(t.effective_remaining)} left</span>`) + `</span>`
+    : `<span class="hours" title="click to set an estimate">estimate?</span>`;
+  el.innerHTML = `
+    <div class="ref"><span>${t.ref}</span>${t.bump_count ? `<span class="pill bump">↻ ${t.bump_count}</span>` : ""}</div>
+    <div class="title">${escapeHtml(t.title)}</div>
+    <div class="meta">
+      <span class="pill ${t.priority}">${t.priority}</span>
+      <span class="pill status ${t.status === "done" ? "done" : ""}">${t.status_label}</span>
+      ${hrs}
+    </div>`;
+  el.addEventListener("dragstart", e => e.dataTransfer.setData("text/plain", String(t.id)));
+  el.querySelector(".hours").addEventListener("click", () => editHours(t));
+  return el;
+}
+
+function escapeHtml(s){ const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+
+/* ---------------- actions ---------------- */
+async function onDrop(e, laneId){
+  const id = parseInt(e.dataTransfer.getData("text/plain"), 10);
+  if (!id) return;
+  const t = findTicket(id);
+  const body = {};
+  if (laneId === "backlog") body.week_lane = null;
+  else {
+    body.week_lane = parseInt(laneId.slice(1), 10);
+    if (t && t.estimate_hours == null){
+      const est = prompt(`Estimate (hours) for ${t.ref} — required to enter a week:`);
+      if (est === null) return;
+      const v = parseFloat(est);
+      if (isNaN(v) || v < 0) return toast("Estimate must be a number of hours");
+      body.estimate_hours = v;
+    }
+  }
+  try {
+    const d = await api("/api/roadmap/tickets/" + id, {method:"PATCH", body:JSON.stringify(body)});
+    if (d.ticket.bump_count > (t?.bump_count || 0)) toast(`${d.ticket.ref} bumped (↻ ${d.ticket.bump_count})`);
+    load();
+  } catch(err){ toast(err.message); }
+}
+
+async function editHours(t){
+  const est = prompt(`Estimate (hours) for ${t.ref}:`, t.estimate_hours ?? "");
+  if (est === null) return;
+  const body = {};
+  const ev = parseFloat(est);
+  if (isNaN(ev) || ev < 0) return toast("Estimate must be a number of hours");
+  body.estimate_hours = ev;
+  if (t.week_lane && t.status !== "done"){
+    const rem = prompt(`Remaining (hours) for ${t.ref}:`, t.remaining_hours ?? ev);
+    if (rem !== null){
+      const rv = parseFloat(rem);
+      if (!isNaN(rv) && rv >= 0) body.remaining_hours = rv;
+    }
+  }
+  try { await api("/api/roadmap/tickets/" + t.id, {method:"PATCH", body:JSON.stringify(body)}); load(); }
+  catch(err){ toast(err.message); }
+}
+
+function findTicket(id){
+  for (const k in BOARD.lanes) for (const t of BOARD.lanes[k]) if (t.id === id) return t;
+  return null;
+}
+
+document.getElementById("rolloverBtn").addEventListener("click", async () => {
+  try {
+    const d = await api("/api/roadmap/rollover", {method:"POST"});
+    toast(d.moved.length ? `Bumped ${d.moved.length} ticket(s) into week ${BOARD.current_week}` : "Nothing to roll over");
+    load();
+  } catch(err){ toast(err.message); }
+});
+
+document.getElementById("cycleBtn").addEventListener("click", () => {
+  document.getElementById("cs").value = new Date().toISOString().slice(0,10);
+  document.getElementById("cycleOverlay").style.display = "flex";
+});
+document.getElementById("cycleCancel").addEventListener("click",
+  () => document.getElementById("cycleOverlay").style.display = "none");
+document.getElementById("cycleForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    await api("/api/roadmap/cycle", {method:"POST", body:JSON.stringify({
+      name: document.getElementById("cn").value,
+      start_date: document.getElementById("cs").value,
+      weeks: parseInt(document.getElementById("cw").value, 10) || 5 })});
+    document.getElementById("cycleOverlay").style.display = "none";
+    load();
+  } catch(err){ document.getElementById("cycleErr").textContent = err.message; }
+});
+
+/* ---------------- burndown ---------------- */
+function drawBurndown(){
+  const c = document.getElementById("burndown");
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth || c.parentElement.clientWidth, H = 150;
+  c.width = W * dpr; c.height = H * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const cyc = BOARD.cycle;
+  if (!cyc){ g.fillStyle = "#8b96ab"; g.fillText("Start a cycle to see the burndown.", 12, 24); return; }
+
+  const day = 86400000;
+  const x0 = new Date(cyc.start_date + "T00:00:00Z").getTime();
+  const x1 = x0 + cyc.weeks * 7 * day;
+  const snaps = BOARD.snapshots || [];
+  const baseline = snaps.length ? snaps[0].total_scope : BOARD.total_scope;
+  const maxY = Math.max(baseline, ...snaps.map(s => s.total_scope), BOARD.total_scope, 1);
+  const padL = 34, padR = 10, padT = 8, padB = 18;
+  const px = t => padL + (W - padL - padR) * Math.min(1, Math.max(0, (t - x0) / (x1 - x0)));
+  const py = v => padT + (H - padT - padB) * (1 - v / maxY);
+
+  // grid: week boundaries + y labels
+  g.strokeStyle = "#2a3345"; g.fillStyle = "#8b96ab"; g.font = "10px sans-serif"; g.lineWidth = 1;
+  for (let wkn = 0; wkn <= cyc.weeks; wkn++){
+    const x = px(x0 + wkn * 7 * day);
+    g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke();
+    if (wkn < cyc.weeks) g.fillText("W" + (wkn + 1), x + 3, H - 6);
+  }
+  for (const f of [0, .5, 1]){
+    const v = maxY * f, y = py(v);
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke();
+    g.fillText(Math.round(v), 4, y + 3);
+  }
+
+  // ideal line: baseline scope → 0 across the cycle
+  g.strokeStyle = "#8b96ab"; g.setLineDash([2, 3]); g.beginPath();
+  g.moveTo(px(x0), py(baseline)); g.lineTo(px(x1), py(0)); g.stroke(); g.setLineDash([]);
+
+  const pts = snaps.map(s => ({t: new Date(s.date + "T00:00:00Z").getTime(),
+                               rem: s.total_remaining, scope: s.total_scope, bumps: s.bumps}));
+  const now = Date.now();
+  if (pts.length){
+    // scope (dashed) — rises on injection
+    g.strokeStyle = "#4f8cff"; g.setLineDash([5, 4]); g.lineWidth = 1.5; g.beginPath();
+    pts.forEach((p, i) => { const x = px(p.t), y = py(p.scope); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.lineTo(px(Math.min(now, x1)), py(pts[pts.length-1].scope)); g.stroke(); g.setLineDash([]);
+    // remaining (solid, stepped)
+    g.strokeStyle = "#e0a83c"; g.lineWidth = 2; g.beginPath();
+    pts.forEach((p, i) => {
+      const x = px(p.t), y = py(p.rem);
+      if (i) { g.lineTo(x, py(pts[i-1].rem)); g.lineTo(x, y); } else g.moveTo(x, y);
+    });
+    g.lineTo(px(Math.min(now, x1)), py(pts[pts.length-1].rem)); g.stroke();
+    // bump ticks
+    g.strokeStyle = "#c069e8"; g.lineWidth = 2;
+    for (const p of pts) if (p.bumps > 0){
+      const x = px(p.t);
+      g.beginPath(); g.moveTo(x, padT); g.lineTo(x, padT + 7); g.stroke();
+      g.fillStyle = "#c069e8"; g.fillText("↻" + p.bumps, x + 2, padT + 8); g.fillStyle = "#8b96ab";
+    }
+  }
+}
+
+window.addEventListener("resize", () => BOARD && drawBurndown());
+setInterval(() => TOKEN && load(), 30000);   // keep the counter honest
+load();
+</script>
+</body>
+</html>

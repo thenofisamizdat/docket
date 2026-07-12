@@ -271,6 +271,29 @@ CREATE TABLE IF NOT EXISTS ticket_links (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_links_pair ON ticket_links(ticket_id, target_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON ticket_links(target_id, status);
+
+-- Roadmap: a fixed-length waterfall cycle (Backlog → Week 1..N → Done) laid
+-- over the existing lifecycle. Tickets keep their normal statuses; the roadmap
+-- only records which week a ticket is committed to plus the hours maths.
+-- Logic lives in roadmap.py; the schema lives here with everything else.
+CREATE TABLE IF NOT EXISTS roadmap_cycles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL DEFAULT '',
+    start_date TEXT NOT NULL,                  -- ISO date; week N spans start+7*(N-1) .. +6
+    weeks      INTEGER NOT NULL DEFAULT 5,
+    created_at TEXT NOT NULL
+);
+
+-- One row per cycle per day — everything the burndown needs. Upserted on every
+-- roadmap mutation and on read, so the chart stays correct without a cron job.
+CREATE TABLE IF NOT EXISTS roadmap_snapshots (
+    cycle_id        INTEGER NOT NULL REFERENCES roadmap_cycles(id) ON DELETE CASCADE,
+    date            TEXT NOT NULL,             -- ISO date
+    total_scope     REAL NOT NULL DEFAULT 0,   -- Σ estimate_hours committed to week lanes
+    total_remaining REAL NOT NULL DEFAULT 0,   -- Σ remaining_hours still open in week lanes
+    bumps           INTEGER NOT NULL DEFAULT 0,-- bump events recorded on this date
+    PRIMARY KEY (cycle_id, date)
+);
 """
 
 
@@ -284,7 +307,12 @@ def init_db() -> None:
         for col, ddl in (("clarity_score", "INTEGER NOT NULL DEFAULT 0"),
                          ("clarity_level", "TEXT NOT NULL DEFAULT ''"),
                          ("touched_paths", "TEXT NOT NULL DEFAULT ''"),
-                         ("touched_routes", "TEXT NOT NULL DEFAULT ''")):
+                         ("touched_routes", "TEXT NOT NULL DEFAULT ''"),
+                         # Roadmap overlay (see roadmap.py):
+                         ("estimate_hours", "REAL"),                       # required to enter a week lane
+                         ("remaining_hours", "REAL"),                      # counts down as work progresses
+                         ("week_lane", "INTEGER"),                         # NULL = backlog; 1..cycle.weeks
+                         ("bump_count", "INTEGER NOT NULL DEFAULT 0")):    # times bumped Wn -> Wn+1
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -497,6 +525,12 @@ def transition(
         if cur_status == "user_review" and to_status in ("queued", "discussion"):
             sets.append("iteration=?")
             vals.append(int(row["iteration"]) + 1)
+
+        # Done zeroes the roadmap hours so the hours-to-completion counter and
+        # burndown react the moment work ships (see roadmap.py).
+        if to_status == "done":
+            sets.append("remaining_hours=?")
+            vals.append(0)
 
         vals.append(ticket_id)
         conn.execute(f"UPDATE tickets SET {', '.join(sets)} WHERE id=?", vals)
