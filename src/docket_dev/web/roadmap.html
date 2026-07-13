@@ -123,7 +123,16 @@
   .modal.wide{width:min(580px,92vw)}
   .modal-btns{display:flex;gap:8px;margin-top:16px}
   .modal-btns button{width:auto;flex:1;margin-top:0}
-  .notes-list{max-height:56vh;overflow:auto;margin-top:4px}
+  .tdetail{max-height:66vh;overflow:auto;margin-top:2px}
+  .topen{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+  .topen a{color:var(--accent);text-decoration:none;font-size:12.5px}
+  .topen a:hover{text-decoration:underline}
+  .tsec{margin-bottom:12px}
+  .tsec-h{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
+  .tcomment{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+            color:var(--text);padding:8px;font-size:13px;min-height:56px;resize:vertical}
+  .tcomment-btn{margin-top:6px}
+  .notes-list{max-height:none;overflow:visible;margin-top:0}
   .notes-list .note{border-top:1px solid var(--line);padding:8px 0}
   .notes-list .note-h{color:var(--dim);font-size:11px;margin-bottom:3px}
   .notes-list .note-b{font-size:12.5px;word-break:break-word;line-height:1.5}
@@ -492,22 +501,51 @@ async function sendToPipeline(t, queue){
   } catch(err){ toast(err.message); }
 }
 
-/* Human-readable work log: the note-kind events on the ticket (incl. the agent's
-   implement/self-review notes and any "Done by Docket pipeline" record). */
+/* A proper ticket view: description, acceptance, a comment box, the full history
+   (markdown-rendered), and a link to the board's full editable detail. */
 async function showNotes(t){
-  openModal(`${t.ref} — ${escapeHtml(t.title)}`, `<div class="notes-list">loading…</div>`, [
-    {label:"Close", cls:"", fn: closeModal},
-  ], true);
-  try {
-    const d = await api("/api/tickets/" + t.id);
-    const events = (d.ticket && d.ticket.events) || d.events || [];
-    const notes = events.filter(e => ["note","comment","transition","assessment","plan"].includes(e.kind));
-    const box = document.querySelector(".notes-list");
-    box.innerHTML = notes.length ? notes.map(e =>
-      `<div class="note"><div class="note-h">${escapeHtml(e.actor||"")} · ${escapeHtml((e.kind||""))} · ${escapeHtml((e.ts||"").slice(0,16).replace("T"," "))}</div>
-       <div class="note-b md">${mdToHtml((e.summary||"").slice(0,6000))}</div></div>`).join("")
-      : `<div class="empty">No work notes yet.</div>`;
-  } catch(err){ const b = document.querySelector(".notes-list"); if (b) b.textContent = err.message; }
+  openModal(`${t.ref} — ${escapeHtml(t.title)}`, `<div class="tdetail">loading…</div>`,
+    [{label:"Close", cls:"", fn: closeModal}], true);
+  await renderTicket(t.id);
+}
+
+async function renderTicket(id){
+  let d;
+  try { d = await api("/api/tickets/" + id); }
+  catch(err){ const b = document.querySelector(".tdetail"); if (b) b.textContent = err.message; return; }
+  const tk = d.ticket || {};
+  const events = tk.events || [];
+  const hist = events.filter(e => ["note","comment","transition","assessment","plan"].includes(e.kind));
+  const box = document.querySelector(".tdetail");
+  if (!box) return;
+  const sec = (title, body) => (body && body.trim())
+    ? `<div class="tsec"><div class="tsec-h">${title}</div><div class="md">${mdToHtml(body)}</div></div>` : "";
+  box.innerHTML = `
+    <div class="topen">
+      <a href="/docket/?ticket=${id}" target="_blank" rel="noopener">Open full ticket (edit / resubmit) ↗</a>
+      <span class="grow"></span>
+      <span class="pill ${tk.priority||''}">${tk.priority||''}</span>
+      <span class="pill">${escapeHtml(tk.status_label||tk.status||'')}</span>
+    </div>
+    ${sec("Description", tk.description) || `<div class="tsec"><div class="tsec-h">Description</div><div class="empty">No description.</div></div>`}
+    ${sec("Acceptance criteria", tk.acceptance_criteria)}
+    <div class="tsec"><div class="tsec-h">Add a comment</div>
+      <textarea class="tcomment" placeholder="Add a comment…"></textarea>
+      <button class="primary tcomment-btn">Post comment</button></div>
+    <div class="tsec"><div class="tsec-h">History</div>
+      <div class="notes-list">${hist.length ? hist.map(e =>
+        `<div class="note"><div class="note-h">${escapeHtml(e.actor||'')} · ${escapeHtml(e.kind||'')} · ${escapeHtml((e.ts||'').slice(0,16).replace('T',' '))}</div>
+         <div class="note-b md">${mdToHtml((e.summary||'').slice(0,6000))}</div></div>`).join('')
+        : `<div class="empty">No history yet.</div>`}</div></div>`;
+  const btn = box.querySelector(".tcomment-btn"), ta = box.querySelector(".tcomment");
+  btn.addEventListener("click", async () => {
+    const text = ta.value.trim();
+    if (!text) return;
+    btn.disabled = true;
+    try { await api("/api/tickets/" + id + "/comment", {method:"POST", body:JSON.stringify({text})});
+      await renderTicket(id);
+    } catch(err){ toast(err.message); btn.disabled = false; }
+  });
 }
 
 /* minimal, XSS-safe markdown → HTML (escape first, then transform) */

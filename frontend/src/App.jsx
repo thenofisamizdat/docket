@@ -17,7 +17,12 @@ export default function App() {
   const [meta, setMeta] = useState(null)
   const [tickets, setTickets] = useState([])
   const [statusMeta, setStatusMeta] = useState({})
-  const [openId, setOpenId] = useState(null)
+  // Deep-link: /docket/?ticket=N opens that ticket's full detail (used by the
+  // roadmap page's "open full ticket" link so there's ONE canonical ticket view).
+  const [openId, setOpenId] = useState(() => {
+    const p = new URLSearchParams(window.location.search).get('ticket')
+    return p ? parseInt(p, 10) : null
+  })
   const [showNew, setShowNew] = useState(false)
   const [newPrefill, setNewPrefill] = useState(null)
   const [err, setErr] = useState('')
@@ -125,7 +130,13 @@ export default function App() {
       {openId != null && meta && (
         <TicketDetail
           ticketId={openId} meta={meta}
-          onClose={() => setOpenId(null)}
+          onClose={() => {
+            setOpenId(null)
+            // Clear a deep-link param so a refresh doesn't reopen it.
+            if (new URLSearchParams(window.location.search).has('ticket')) {
+              window.history.replaceState({}, '', window.location.pathname)
+            }
+          }}
           onChanged={loadBoard}
         />
       )}
