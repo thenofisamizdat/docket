@@ -28,6 +28,10 @@ def _roadmap_page() -> str:
     return str(files("docket_dev") / "web" / "roadmap.html")
 
 
+def _build_page() -> str:
+    return str(files("docket_dev") / "web" / "build.html")
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Docket", docs_url=None, redoc_url=None)
     storage.init_db()
@@ -44,6 +48,12 @@ def create_app() -> FastAPI:
         @app.get("/roadmap", include_in_schema=False)
         def roadmap_page():
             return FileResponse(_roadmap_page(), media_type="text/html")
+
+    # Run Full Build page — self-contained, same-origin (shares the login cookie).
+    if _P(_build_page()).is_file():
+        @app.get("/build", include_in_schema=False)
+        def build_page():
+            return FileResponse(_build_page(), media_type="text/html")
 
     # Mounted last so the API routes above take precedence. html=True serves
     # index.html for the SPA; the bundle is built with base="/docket/". Guarded

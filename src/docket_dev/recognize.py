@@ -132,3 +132,83 @@ def seed_tickets(limit: int = 8, on_activity=None) -> List[dict]:
         except ValueError:
             continue
     return created
+
+
+def _parse_ticket_array(text: str) -> List[dict]:
+    """Best-effort extraction of a JSON array of ticket dicts from model output.
+    The groomed array is large, so tolerate a wrapping code fence, prose around the
+    array, and trailing commas rather than aborting the whole batch (the bare
+    `json.loads` in seed_tickets is too brittle for this)."""
+    t = _strip_fence(text or "")
+    start, end = t.find("["), t.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return []
+    blob = t[start:end + 1]
+    candidates = [blob, re.sub(r",(\s*[\]}])", r"\1", blob)]  # 2nd: strip trailing commas
+    for cand in candidates:
+        try:
+            v = json.loads(cand)
+        except ValueError:
+            continue
+        if isinstance(v, list):
+            return [it for it in v if isinstance(it, dict)]
+    return []
+
+
+def groom_brief(brief_text: str, *, cap: int = 40, on_activity=None) -> List[dict]:
+    """Groom a completed PROJECT_BRIEF into a COMPLETE, ORDERED backlog that builds
+    the ENTIRE project — scaffolding/setup tickets first, then features in
+    dependency order. Each ticket gets a 1-based `build_seq`; all land in Discussion
+    for review, then "Run Full Build" submits them in that order. Generalizes
+    seed_tickets (repo-driven) to work purely from the brief (there's no code yet)."""
+    prompt = (
+        "You are the planning lead for a BRAND-NEW software project. Below is the "
+        "completed project brief. Produce the COMPLETE backlog of tickets that, built "
+        "in order by a coding agent, delivers the ENTIRE project described.\n\n"
+        "RULES:\n"
+        "- SCAFFOLDING/SETUP tickets FIRST: repo layout, tooling/dependencies, the "
+        "base app skeleton, config, and (if relevant) CI — everything that must exist "
+        "before features can be built.\n"
+        "- THEN features in DEPENDENCY ORDER: a ticket must never depend on work that "
+        "comes later in the list.\n"
+        "- Each ticket is small, concrete, and independently buildable on a fresh "
+        "checkout by an agent that reads the repo + the ticket.\n"
+        "- Cover every Must-have fully; include Should-haves; skip Could-haves unless "
+        "trivial.\n\n"
+        f"Return ONLY a JSON array (no prose, no code fences) of up to {cap} objects, "
+        "IN BUILD ORDER, each with keys:\n"
+        '  "sequence" (1-based build order, ascending),\n'
+        '  "title" (short, specific), "type" ("bug" or "feature"),\n'
+        '  "description" (what to build + why, grounded in the brief),\n'
+        '  "acceptance_criteria" (observable, testable outcome),\n'
+        '  "priority" ("P0".."P3"; put scaffolding at P1 so it runs before P2 features).\n\n'
+        "=== PROJECT BRIEF ===\n" + (brief_text or "").strip()[:16000]
+    )
+    res = _read_only_claude(prompt, max_turns=30, budget=4.0, on_activity=on_activity)
+    items = _parse_ticket_array(res.get("text") or "")
+
+    def _seq(it: dict, i: int) -> int:
+        try:
+            return int(it.get("sequence"))
+        except (TypeError, ValueError):
+            return 10_000 + i
+
+    valid = [it for it in items if (it.get("title") or "").strip()]
+    ordered = sorted(enumerate(valid), key=lambda p: _seq(p[1], p[0]))
+    created = []
+    for build_seq, (_, it) in enumerate(ordered[:cap], start=1):
+        ttype = it.get("type") if it.get("type") in ("bug", "feature") else "feature"
+        try:
+            t = dk.create_ticket(
+                title=str(it.get("title", ""))[:300],
+                type=ttype,
+                description=str(it.get("description", "")),
+                acceptance_criteria=str(it.get("acceptance_criteria", "")),
+                priority=str(it.get("priority", "P2")),
+                created_by="docket",
+                build_seq=build_seq,
+            )
+            created.append(t)
+        except ValueError:
+            continue
+    return created

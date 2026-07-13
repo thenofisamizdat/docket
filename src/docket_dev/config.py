@@ -46,6 +46,13 @@ class Config:
     agent_writes: bool = True
     agent_push: bool = True
     agent_auto_merge: bool = False   # squash-merge the PR via API once self-review passes
+    # How finished work reaches the base branch:
+    #   "pr"          — push a docket/DKT-<id> branch, open a PR, merge on GitHub (default)
+    #   "auto_merge"  — same, but squash-merge the PR automatically once self-review passes
+    #   "direct_main" — no branch/PR: commit straight onto base_branch (push to the remote
+    #                   if one exists, else stay local). Required for repos with no GitHub
+    #                   remote (e.g. greenfield projects) and for "build on main anyway".
+    agent_dev_mode: str = "pr"
     agent_model: str = "opus"        # default to the strongest model — quality > cost
     agent_strong_model: str = "opus" # model the recovery router escalates to (scope/defect)
     agent_poll_secs: int = 20
@@ -124,6 +131,9 @@ def _from_dict(project_root: Path, data: Dict[str, Any]) -> Config:
         agent_writes=bool(agent.get("writes", True)),
         agent_push=bool(agent.get("push", True)),
         agent_auto_merge=bool(agent.get("auto_merge", False)),
+        # Back-compat: infer the mode from the legacy auto_merge flag when unset.
+        agent_dev_mode=agent.get("dev_mode",
+                                 "auto_merge" if agent.get("auto_merge") else "pr"),
         agent_model=agent.get("model", "opus"),
         agent_strong_model=agent.get("strong_model", "opus"),
         agent_poll_secs=int(agent.get("poll_secs", 20)),
@@ -173,6 +183,7 @@ def to_toml(cfg: Config) -> str:
         f"writes = {str(cfg.agent_writes).lower()}",
         f"push = {str(cfg.agent_push).lower()}",
         f"auto_merge = {str(cfg.agent_auto_merge).lower()}",
+        f'dev_mode = "{esc(cfg.agent_dev_mode)}"',
         f'model = "{esc(cfg.agent_model)}"',
         f'strong_model = "{esc(cfg.agent_strong_model)}"',
         f"poll_secs = {cfg.agent_poll_secs}",
@@ -248,6 +259,7 @@ def apply_env(cfg: Config) -> None:
         "DOCKET_AGENT_WRITES": "1" if cfg.agent_writes else "0",
         "DOCKET_AGENT_PUSH": "1" if cfg.agent_push else "0",
         "DOCKET_AGENT_AUTO_MERGE": "1" if cfg.agent_auto_merge else "0",
+        "DOCKET_AGENT_DEV_MODE": cfg.agent_dev_mode,
         "DOCKET_AGENT_MODEL": cfg.agent_model,
         "DOCKET_AGENT_STRONG_MODEL": cfg.agent_strong_model,
         "DOCKET_AGENT_POLL": str(cfg.agent_poll_secs),

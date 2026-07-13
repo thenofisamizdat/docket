@@ -1,0 +1,156 @@
+<!doctype html>
+<!--
+  Docket — Run Full Build.
+
+  A single self-contained page (no build step) served at /build by app.py. Shows
+  the groomed backlog for THIS project in build order and offers one button that
+  submits every Discussion ticket into the queue (POST /api/tickets/build/run) so
+  the agent builds the whole project ticket-by-ticket. Same-origin with the board,
+  so it shares the tester `testing_token` login.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docket — Run Full Build</title>
+<style>
+  :root{--bg:#0e1117;--panel:#161b24;--panel2:#1c2330;--line:#2a3345;
+        --text:#e6ebf4;--dim:#8b96ab;--accent:#4f8cff;--ok:#3fb96a;--warn:#e0a83c;--bad:#e05252;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:17px;margin:0;font-weight:650}
+  header h1 span{color:var(--accent)}
+  .spacer{flex:1}
+  a{color:var(--accent);text-decoration:none}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+         border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button:disabled{opacity:.5;cursor:default}
+  .wrap{max-width:900px;margin:0 auto;padding:20px 22px}
+  .bar{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+  .count{color:var(--dim)}
+  .msg{padding:10px 14px;border-radius:8px;margin-bottom:14px;display:none}
+  .msg.ok{background:rgba(63,185,106,.12);border:1px solid var(--ok);color:var(--ok);display:block}
+  .msg.err{background:rgba(224,82,82,.12);border:1px solid var(--bad);color:var(--bad);display:block}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+  .seq{color:var(--accent);font-weight:700;width:44px}
+  .ref{color:var(--dim);white-space:nowrap}
+  .pri{font-size:11px;color:var(--dim)}
+  .desc{color:var(--dim);font-size:12.5px}
+  .empty{color:var(--dim);padding:40px 0;text-align:center}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:320px}
+  .modal h2{margin:0 0 14px;font-size:16px}
+  .modal label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+  .modal input{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:7px;
+               padding:8px;color:var(--text)}
+  .modal button{width:100%;margin-top:16px}
+  .err{color:var(--bad);font-size:12px;min-height:16px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Docket<span>·</span>Run Full Build</h1>
+  <div class="spacer"></div>
+  <a href="/docket">← Board</a>
+</header>
+
+<div class="wrap">
+  <div class="msg" id="msg"></div>
+  <div class="bar">
+    <button class="primary" id="runBtn" disabled>▶ Run Full Build</button>
+    <span class="count" id="count"></span>
+    <div class="spacer"></div>
+    <button id="refresh">Refresh</button>
+  </div>
+  <div id="list"></div>
+</div>
+
+<!-- login -->
+<div class="overlay" id="loginOverlay" style="display:none">
+  <form class="modal" id="loginForm">
+    <h2>Sign in to Docket</h2>
+    <label>Username</label><input id="lu" autocomplete="username">
+    <label>Password</label><input id="lp" type="password" autocomplete="current-password">
+    <div class="err" id="loginErr"></div>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+</div>
+
+<script>
+"use strict";
+let TOKEN = null, BACKLOG = [];
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({"Content-Type":"application/json"},
+    TOKEN ? {"Authorization":"Bearer " + TOKEN} : {}, opts.headers || {});
+  const r = await fetch(path, opts);
+  if (r.status === 401) { showLogin(); throw new Error("auth"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+function showLogin(){ document.getElementById("loginOverlay").style.display="flex"; }
+document.getElementById("loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    const d = await api("/api/testing/login", {method:"POST", body:JSON.stringify({
+      username: document.getElementById("lu").value,
+      password: document.getElementById("lp").value })});
+    TOKEN = d.token;
+    document.cookie = "testing_token=" + TOKEN + "; path=/; max-age=" + 7*24*3600 + "; samesite=lax";
+    document.getElementById("loginOverlay").style.display = "none";
+    load();
+  } catch(err){ document.getElementById("loginErr").textContent = "Invalid username or password"; }
+});
+(function(){ const m = document.cookie.match(/(?:^|;\s*)testing_token=([^;]+)/); if (m) TOKEN = m[1]; })();
+
+function esc(s){ return (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+async function load(){
+  let board;
+  try { board = await api("/api/tickets/board"); } catch(e){ return; }
+  const tickets = board.tickets || board || [];
+  BACKLOG = tickets.filter(t => t.status === "discussion")
+    .sort((a,b) => ((a.build_seq ?? 1e9) - (b.build_seq ?? 1e9)) || (a.id - b.id));
+  render();
+}
+
+function render(){
+  const btn = document.getElementById("runBtn");
+  document.getElementById("count").textContent =
+    BACKLOG.length ? BACKLOG.length + " ticket(s) in the backlog, in build order" : "";
+  btn.disabled = BACKLOG.length === 0;
+  const list = document.getElementById("list");
+  if (!BACKLOG.length){
+    list.innerHTML = '<div class="empty">No Discussion tickets. Run <code>docket groom</code> to draft the backlog from PROJECT_BRIEF.md.</div>';
+    return;
+  }
+  let rows = BACKLOG.map((t,i) => `<tr>
+    <td class="seq">${t.build_seq ?? (i+1)}</td>
+    <td class="ref">${esc(t.ref)}</td>
+    <td><div>${esc(t.title)}</div><div class="desc">${esc((t.description||"").slice(0,140))}</div></td>
+    <td class="pri">${esc(t.priority||"")}</td></tr>`).join("");
+  list.innerHTML = `<table><thead><tr><th>#</th><th>Ref</th><th>Ticket</th><th>Pri</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+document.getElementById("runBtn").addEventListener("click", async () => {
+  if (!confirm("Submit all " + BACKLOG.length + " tickets into the pipeline? The agent will build them in order.")) return;
+  const msg = document.getElementById("msg");
+  try {
+    const d = await api("/api/tickets/build/run", {method:"POST", body:"{}"});
+    msg.className = "msg ok";
+    msg.innerHTML = `Queued ${d.queued} of ${d.total} tickets. Watch them build on the <a href="/docket">board →</a>`;
+    load();
+  } catch(e){ msg.className = "msg err"; msg.textContent = "Failed: " + e.message; }
+});
+document.getElementById("refresh").addEventListener("click", load);
+load();
+</script>
+</body>
+</html>

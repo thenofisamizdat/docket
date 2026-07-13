@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docket-dev"
-version = "0.1.0"
+version = "0.2.0"
 description = "Docket — a portable ticket pipeline + autonomous dev agent you install into any git repo."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -42,4 +42,4 @@ docket = "docket_dev.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"docket_dev" = ["web/dist/**/*", "web/roadmap.html"]
+"docket_dev" = ["web/dist/**/*", "web/roadmap.html", "web/build.html", "web/service.html"]

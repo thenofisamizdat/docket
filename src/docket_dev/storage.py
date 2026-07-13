@@ -98,7 +98,9 @@ TRANSITIONS: Dict[str, set] = {
     "assessment":        {"planning", "needs_info", "stalled", "queued"},
     "planning":          {"in_development", "needs_info", "stalled", "queued"},
     "in_development":    {"self_review", "needs_info", "stalled", "queued"},
-    "self_review":       {"pr", "in_development", "stalled", "queued", "needs_info"},
+    # "user_review" direct from self_review is the direct_main path (no PR gate):
+    # the agent committed straight to the base branch and advances the ticket itself.
+    "self_review":       {"pr", "user_review", "in_development", "stalled", "queued", "needs_info"},
     "pr":                {"user_review", "changes_requested", "cancelled"},
     "changes_requested": {"in_development", "cancelled"},
     "user_review":       {"done", "queued", "discussion", "cancelled"},
@@ -312,7 +314,9 @@ def init_db() -> None:
                          ("estimate_hours", "REAL"),                       # required to enter a week lane
                          ("remaining_hours", "REAL"),                      # counts down as work progresses
                          ("week_lane", "INTEGER"),                         # NULL = backlog; 1..cycle.weeks
-                         ("bump_count", "INTEGER NOT NULL DEFAULT 0")):    # times bumped Wn -> Wn+1
+                         ("bump_count", "INTEGER NOT NULL DEFAULT 0"),     # times bumped Wn -> Wn+1
+                         # Build order for greenfield grooming / "Run Full Build":
+                         ("build_seq", "INTEGER")):                        # 1-based build order; NULL = unset
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -369,8 +373,11 @@ def create_ticket(
     priority: str = DEFAULT_PRIORITY,
     created_by: str = "",
     seed_user_item_id: str = "",
+    build_seq: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Raise a new ticket in the Discussion zone. Returns the created ticket."""
+    """Raise a new ticket in the Discussion zone. Returns the created ticket.
+    `build_seq` records 1-based build order (set by greenfield grooming; drives
+    "Run Full Build")."""
     title = (title or "").strip()
     if not title:
         raise ValueError("title is required")
@@ -387,11 +394,11 @@ def create_ticket(
             """INSERT INTO tickets
                (title, type, description, acceptance_criteria, clarity_score,
                 clarity_level, priority, status, created_by, seed_user_item_id,
-                created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?)""",
+                build_seq, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?)""",
             (title[:300], type, str(description)[:20000],
              str(acceptance_criteria)[:10000], clarity["score"], clarity["level"],
-             priority, created_by, seed_user_item_id, now, now),
+             priority, created_by, seed_user_item_id, build_seq, now, now),
         )
         tid = cur.lastrowid
         conn.execute(

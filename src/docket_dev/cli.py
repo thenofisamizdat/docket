@@ -122,6 +122,8 @@ def cmd_init(args) -> int:
         default_recipient=username,
         agent_writes=not args.no_writes,
         agent_push=(not args.no_writes) and (not args.no_push),
+        agent_auto_merge=(args.dev_mode == "auto_merge"),
+        agent_dev_mode=args.dev_mode,
         agent_model=args.model,
     )
     cfgmod.set_config(cfg)
@@ -137,6 +139,15 @@ def cmd_init(args) -> int:
 
     from docket_dev import storage
     storage.init_db()
+
+    # Register with the service control plane so this repo shows on the dashboard.
+    try:
+        from docket_dev import service
+        service.register_project(
+            id=service.unit_slug(slug or root.name), name=slug or root.name,
+            kind="existing", root=str(root), port=port, dev_mode=args.dev_mode)
+    except Exception as e:
+        print(f"  (note: could not register with the service dashboard: {e})")
 
     print(f"Docket initialized for {slug or root.name}")
     print(f"  config:  {out}")
@@ -200,6 +211,174 @@ def cmd_recognize(args) -> int:
 def cmd_seed(args) -> int:
     _load_or_die()
     _recognize(profile=False, claude_md=False, seed=True, seed_limit=args.seed_limit)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# new (greenfield) + groom
+# ---------------------------------------------------------------------------
+
+PROJECT_BRIEF_TEMPLATE = """\
+# Project Brief — {name}
+
+<!--
+  Fill in every "USER:" section below, then run `docket groom` (or click Groom on
+  the dashboard). Docket feeds this brief to Claude, which grooms it into an
+  ordered backlog that builds the whole project. The more concrete you are here,
+  the better the tickets — vague briefs make vague tickets.
+-->
+
+## One-liner
+<!-- USER: one sentence — what is this and who is it for? -->
+
+## Problem / goal
+<!-- USER: what problem does it solve? what does success look like? -->
+
+## Target users
+<!-- USER: who uses it, and in what context? -->
+
+## Core features
+<!-- USER: list them, grouped by importance. Be specific about behaviour. -->
+### Must have
+-
+### Should have
+-
+### Could have
+-
+
+## Tech stack
+<!-- USER: languages/frameworks/db/hosting. If unsure, say so and suggest a default
+     (e.g. "Python + FastAPI + SQLite + a small React frontend"). -->
+
+## Data / entities
+<!-- USER: the main things the app stores and their key fields/relationships. -->
+
+## Integrations
+<!-- USER: external APIs/services/auth providers, if any. -->
+
+## Constraints
+<!-- USER: performance, security, compliance, budget, deadlines, must-use tech. -->
+
+## Non-goals
+<!-- USER: explicitly out of scope, so the agent doesn't build it. -->
+
+## UX / design notes
+<!-- USER: look & feel, key screens/flows, accessibility. -->
+
+## Success criteria
+<!-- USER: how you'll judge "done" — observable, testable outcomes. -->
+"""
+
+
+def _git_run(args, cwd: Path) -> bool:
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def _init_repo(path: Path) -> None:
+    """git init a fresh repo on branch `main` (deterministic base branch)."""
+    if not _git_run(["init", "-b", "main"], path):        # older git: no -b
+        _git_run(["init"], path)
+        _git_run(["symbolic-ref", "HEAD", "refs/heads/main"], path)
+
+
+def cmd_new(args) -> int:
+    from docket_dev import service
+    name = args.name.strip()
+    if not name:
+        print("error: project name is required.", file=sys.stderr)
+        return 2
+    slug = service.slugify(name)
+    path = Path(args.path).resolve() if args.path else (Path.cwd() / slug)
+    if path.exists() and any(path.iterdir()):
+        print(f"error: {path} exists and is not empty.", file=sys.stderr)
+        return 2
+    path.mkdir(parents=True, exist_ok=True)
+    _init_repo(path)
+
+    # Greenfield git identity — the agent's `git commit` fails without one.
+    username = (args.user or _git(["config", "user.name"], path).split()[:1] or ["dev"])[0].lower()
+    username = "".join(ch for ch in username if ch.isalnum()) or "dev"
+    email = args.email or _git(["config", "user.email"], path) or "docket@localhost"
+    _git_run(["config", "user.name", args.user or username], path)
+    _git_run(["config", "user.email", email], path)
+    password = args.password or "testing"
+
+    port = args.port or service.allocate_port()
+    cfg = Config(
+        project_root=path,
+        repo_slug="",                       # no GitHub remote yet
+        base_branch="main",
+        remote="origin",
+        port=port,
+        base_url=f"http://localhost:{port}",
+        jwt_secret=secrets.token_urlsafe(48),
+        testers=[{"username": username, "name": username.capitalize(),
+                  "email": email, "password": password}],
+        user_test_lead=username,
+        default_recipient=username,
+        agent_writes=True,
+        agent_push=False,                   # nothing to push to (no remote)
+        agent_dev_mode=args.dev_mode,       # default direct_main (see parser)
+        agent_model=args.model,
+    )
+    cfgmod.set_config(cfg)
+    out = cfgmod.save_config(cfg)
+
+    gi = path / ".gitignore"
+    gi.write_text(".docket/\n" + (gi.read_text() if gi.exists() else ""))
+
+    from docket_dev import storage
+    storage.init_db()
+
+    # The brief is the starting point; a lightweight CLAUDE.md grounds the first
+    # scaffolding ticket (profile.md is skipped — an empty repo yields nothing;
+    # run `docket recognize` after scaffolding to generate it from real code).
+    (path / "PROJECT_BRIEF.md").write_text(PROJECT_BRIEF_TEMPLATE.format(name=name))
+    claude_md = path / "CLAUDE.md"
+    if not claude_md.exists():
+        claude_md.write_text(
+            f"# {name}\n\nBrand-new project scaffolded by Docket. The authoritative "
+            "spec is `PROJECT_BRIEF.md` — read it before building. Tickets are built "
+            "one at a time on `main` (no PRs); keep changes small and self-contained.\n")
+
+    # Initial commit — gives direct_main a real base SHA to diff against.
+    _git_run(["add", "-A"], path)
+    _git_run(["commit", "-m", "Docket: initial project brief + scaffolding stub"], path)
+
+    service.register_project(id=slug, name=name, kind="greenfield",
+                             root=str(path), port=port, dev_mode=args.dev_mode)
+
+    print(f"Created greenfield project '{name}'")
+    print(f"  path:     {path}")
+    print(f"  config:   {out}  (dev_mode={args.dev_mode}, port {port})")
+    print(f"  login:    {username} / {password}")
+    print(f"\nNext:")
+    print(f"  1. Edit {path / 'PROJECT_BRIEF.md'} — fill in every USER: section.")
+    print(f"  2. cd {path} && docket groom     # groom the brief into an ordered backlog")
+    print(f"  3. docket up                      # start the board + agent, then Run Full Build")
+    return 0
+
+
+def cmd_groom(args) -> int:
+    cfg = _load_or_die()
+    from docket_dev import recognize
+    brief_path = cfg.project_root / "PROJECT_BRIEF.md"
+    if not brief_path.is_file():
+        print(f"error: no PROJECT_BRIEF.md at {brief_path}. Run `docket new` first.",
+              file=sys.stderr)
+        return 2
+    if not shutil.which("claude"):
+        print("error: 'claude' CLI not found — grooming needs it.", file=sys.stderr)
+        return 2
+    print("  grooming PROJECT_BRIEF.md into an ordered backlog...")
+    created = recognize.groom_brief(brief_path.read_text(), cap=args.cap,
+                                    on_activity=_activity)
+    print(f"    → drafted {len(created)} tickets into Discussion (build order):")
+    for t in created:
+        print(f"        {t['ref']}  {t['title']}")
+    if created:
+        print("\nNext:  docket up, then open /build and click Run Full Build.")
     return 0
 
 
@@ -274,6 +453,39 @@ def cmd_status(args) -> int:
         print(f"  tickets: {total} total" + (f"  ({', '.join(f'{k}:{v}' for k,v in sorted(counts.items()))})" if total else ""))
     except Exception as e:
         print(f"  tickets: (unreadable: {e})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# service control plane
+# ---------------------------------------------------------------------------
+
+def cmd_service(args) -> int:
+    """Run the multi-project control-plane dashboard (does NOT load any single
+    project — it manages the registry and shells out to per-project `docket`)."""
+    import uvicorn
+    from docket_dev import service
+    from docket_dev.control_app import app
+    host = args.host or "127.0.0.1"
+    port = args.port or service.DASHBOARD_PORT
+    print(f"Docket service dashboard at http://{host}:{port}  (Ctrl-C to stop)")
+    print(f"  registry: {service.PROJECTS_TOML}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
+    return 0
+
+
+def cmd_projects(args) -> int:
+    from docket_dev import service
+    projects = service.load_projects()
+    if not projects:
+        print("No projects registered. Create one with `docket new <name>` or "
+              "`docket init` in a repo.")
+        return 0
+    print(f"{'ID':<24} {'KIND':<10} {'PORT':<6} {'MODE':<12} STATUS")
+    for p in projects:
+        print(f"{p.get('id',''):<24} {p.get('kind',''):<10} "
+              f"{str(p.get('port','')):<6} {p.get('dev_mode',''):<12} "
+              f"{service.project_status(p)}")
     return 0
 
 
@@ -385,12 +597,39 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--email", help="login email (default: git user.email)")
     pi.add_argument("--password", help="login password (default: testing)")
     pi.add_argument("--model", default="opus", help="agent model (default: opus)")
+    pi.add_argument("--dev-mode", choices=("pr", "auto_merge", "direct_main"), default="pr",
+                    help="how finished work ships: pr (branch+PR), auto_merge, or "
+                         "direct_main (commit straight to base branch, no PR)")
     pi.add_argument("--no-writes", action="store_true", help="grooming only (no code-gen)")
     pi.add_argument("--no-push", action="store_true", help="implement + commit locally but hold the push for inspection")
     pi.add_argument("--no-recognize", action="store_true", help="skip codebase recognition")
     pi.add_argument("--seed-limit", type=int, default=8)
     pi.add_argument("--force", action="store_true", help="overwrite existing config")
     pi.set_defaults(func=cmd_init)
+
+    pn = sub.add_parser("new", help="create a new (greenfield) project from scratch")
+    pn.add_argument("name", help="project name")
+    pn.add_argument("--path", help="target folder (default: ./<slug>)")
+    pn.add_argument("--port", type=int, help="web port (default: auto-allocate)")
+    pn.add_argument("--dev-mode", choices=("pr", "auto_merge", "direct_main"),
+                    default="direct_main",
+                    help="default direct_main — greenfield has no remote, so no PR")
+    pn.add_argument("--model", default="opus", help="agent model (default: opus)")
+    pn.add_argument("--user", help="login username (default: git user.name)")
+    pn.add_argument("--email", help="login email")
+    pn.add_argument("--password", help="login password (default: testing)")
+    pn.set_defaults(func=cmd_new)
+
+    pg = sub.add_parser("groom", help="groom PROJECT_BRIEF.md into an ordered backlog")
+    pg.add_argument("--cap", type=int, default=40, help="max tickets to draft")
+    pg.set_defaults(func=cmd_groom)
+
+    psvc = sub.add_parser("service", help="run the multi-project control-plane dashboard")
+    psvc.add_argument("--host", help="bind host (default: 127.0.0.1)")
+    psvc.add_argument("--port", type=int, help="dashboard port (default: 8010)")
+    psvc.set_defaults(func=cmd_service)
+
+    sub.add_parser("projects", help="list registered projects + status").set_defaults(func=cmd_projects)
 
     pu = sub.add_parser("up", help="run web UI + agent")
     pu.add_argument("--daemon", action="store_true",

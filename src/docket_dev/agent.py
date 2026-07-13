@@ -55,6 +55,15 @@ PUSH_ENABLED = os.environ.get("DOCKET_AGENT_PUSH", "1" if WRITES_ENABLED else "0
 # mark the ticket done. Requires a real PR object (i.e. a GitHub token); without a
 # token it safely no-ops and the ticket waits at PR for a manual merge.
 AUTO_MERGE = os.environ.get("DOCKET_AGENT_AUTO_MERGE", "0") == "1"
+# Delivery mode for finished work (see Config.agent_dev_mode):
+#   "pr"          — branch + PR (the default; PUSH/AUTO_MERGE gates apply)
+#   "auto_merge"  — branch + PR, squash-merged automatically
+#   "direct_main" — no branch/PR: commit straight onto BASE_BRANCH, push to REMOTE
+#                   only if a remote exists, then advance the ticket itself.
+DEV_MODE = os.environ.get("DOCKET_AGENT_DEV_MODE", "pr")
+# Fold the new mode into the legacy flag so the existing AUTO_MERGE code path is reused.
+AUTO_MERGE = AUTO_MERGE or DEV_MODE == "auto_merge"
+DIRECT_MAIN = DEV_MODE == "direct_main"
 # Default model for EVERY phase. Docket defaults to the strongest model (Opus)
 # because pipeline quality matters more than per-ticket cost/speed; override per
 # install via [agent].model in .docket/config.toml or DOCKET_AGENT_MODEL.
@@ -304,8 +313,21 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
 # Worktrees
 # ---------------------------------------------------------------------------
 
+def _ensure_base_checkout() -> tuple[Path, str]:
+    """direct_main mode: no worktree. Work happens in the main checkout itself, on
+    BASE_BRANCH, so commits land straight on the base branch. Returns
+    (MAIN_CHECKOUT, BASE_BRANCH)."""
+    subprocess.run(["git", "-C", str(MAIN_CHECKOUT), "checkout", BASE_BRANCH],
+                   check=True, capture_output=True, text=True)
+    return MAIN_CHECKOUT, BASE_BRANCH
+
+
 def ensure_worktree(ticket: dict) -> tuple[Path, str]:
-    """Create (or reuse) a per-ticket git worktree + branch off the base branch."""
+    """Create (or reuse) a per-ticket git worktree + branch off the base branch.
+    In direct_main mode there is no worktree/branch — we operate on BASE_BRANCH in
+    the main checkout so work commits directly to it."""
+    if DIRECT_MAIN:
+        return _ensure_base_checkout()
     tid = ticket["id"]
     branch = f"docket/DKT-{tid}"
     path = WORKTREE_DIR / f"DKT-{tid}"
@@ -768,6 +790,14 @@ def process_ticket(t: dict) -> None:
     # without ever re-running development; that single bug stalled most tickets.
     wt, branch = ensure_worktree(t)
     dk.transition(tid, "in_development", actor="agent")
+    # What this ticket changed is measured against `base_ref`. For branch work
+    # that's BASE_BRANCH; in direct_main we ARE on BASE_BRANCH, so diffing against
+    # it is always empty — capture the pre-work tip and diff against that instead.
+    base_ref = BASE_BRANCH
+    if DIRECT_MAIN:
+        base_ref = (subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                    capture_output=True, text=True).stdout.strip()
+                    or BASE_BRANCH)
     iteration = int(t.get("iteration") or 0)
     fix_feedback = ""
     pr_body = ""
@@ -809,7 +839,7 @@ def process_ticket(t: dict) -> None:
         # whose fix was already committed on its branch in a prior pass makes no
         # *new* edits yet is NOT a no-op. Only an empty branch is.
         files_stat = subprocess.run(
-            ["git", "-C", str(wt), "diff", "--stat", BASE_BRANCH, "HEAD"],
+            ["git", "-C", str(wt), "diff", "--stat", base_ref, "HEAD"],
             capture_output=True, text=True).stdout
         if not files_stat.strip():
             # Truly nothing on the branch. Route through triage: a real no-op
@@ -862,14 +892,14 @@ def process_ticket(t: dict) -> None:
         # Exhausted the model-escalated corrective loop. Don't just stall —
         # triage decides whether this is really an underspecified ask (bounce to
         # the requester) or a genuine blocker (human-gated stall).
-        files_stat = subprocess.run(["git", "-C", str(wt), "diff", "--stat", BASE_BRANCH],
+        files_stat = subprocess.run(["git", "-C", str(wt), "diff", "--stat", base_ref],
                                     capture_output=True, text=True).stdout
         return recover(t, f"self-review (still failing after {MAX_DEV_PASSES} dev passes)",
                        fix_feedback, wt=wt, diff_summary=files_stat)
 
     # Record what the change touched — the join key for post-ship telemetry.
     try:
-        paths, routes = extract_touched(wt)
+        paths, routes = extract_touched(wt, base_ref)
         dk.update_ticket(tid, touched_paths=json.dumps(paths),
                          touched_routes=json.dumps(routes))
         if routes:
@@ -910,6 +940,34 @@ def process_ticket(t: dict) -> None:
             )
             instructions = banner + instructions
         dk.update_ticket(tid, test_instructions=instructions)
+
+    # --- direct_main: no branch, no PR. Work is already committed on BASE_BRANCH
+    # in the main checkout; push to the remote if one exists, then advance the
+    # ticket itself (self_review → user_review → done) so a full build flows
+    # ticket-by-ticket without a PR gate. ---
+    if DIRECT_MAIN:
+        ref = dk.get_ticket(tid)["ref"]
+        head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        pushed_note = ""
+        if PUSH_ENABLED and _has_remote():
+            if _git(wt, ["push", REMOTE, BASE_BRANCH]):
+                pushed_note = f" and pushed to {REMOTE}/{BASE_BRANCH}"
+            else:
+                log(f"  ⚠ DKT-{tid}: push to {REMOTE}/{BASE_BRANCH} failed — committed locally only")
+        vstatus = ("✅ Agent-verified (reproduced the fix)." if verified
+                   else "⚠️ NOT agent-verified — reproduce the original problem when testing.")
+        dk.update_ticket(tid, branch=BASE_BRANCH)
+        dk.add_event(tid, "note", actor="agent",
+                     summary=f"Committed directly to `{BASE_BRANCH}` ({head[:7]}){pushed_note} — "
+                             f"no PR (direct_main mode). {vstatus}")
+        dk.transition(tid, "user_review", actor="agent",
+                      summary=f"Committed to {BASE_BRANCH} ({head[:7]}) — no PR (direct_main)")
+        dk.transition(tid, "done", actor="agent",
+                      summary=f"Shipped to {BASE_BRANCH}{pushed_note}")
+        log(f"  → DKT-{tid}: shipped to {BASE_BRANCH} ({head[:7]}){pushed_note} "
+            f"[{'verified' if verified else 'UNVERIFIED'}]")
+        return
 
     # --- PR (push branch + record compare URL; never auto-merge) ---
     if not PUSH_ENABLED:
@@ -964,12 +1022,15 @@ _ROUTE_DECOR_RE = _re.compile(
 _PREFIX_RE = _re.compile(r'APIRouter\([^)]*prefix\s*=\s*["\']([^"\']+)["\']', _re.S)
 
 
-def extract_touched(wt: Path) -> tuple[list, list]:
+def extract_touched(wt: Path, base: str = "") -> tuple[list, list]:
     """What the implementation touched: changed files, plus a best-effort list of
     API route templates (from @router decorators in the changed hunks, resolved
     against the file's APIRouter prefix). This is the join key that lets platform
-    telemetry measure the shipped feature's real traffic and error rate."""
-    r = subprocess.run(["git", "-C", str(wt), "diff", "--name-only", BASE_BRANCH],
+    telemetry measure the shipped feature's real traffic and error rate. `base` is
+    the ref to diff against — BASE_BRANCH for branch work, or the pre-work SHA in
+    direct_main mode (where the work IS on BASE_BRANCH)."""
+    base = base or BASE_BRANCH
+    r = subprocess.run(["git", "-C", str(wt), "diff", "--name-only", base],
                        capture_output=True, text=True)
     paths = [p for p in r.stdout.split() if p]
     routes: set = set()
@@ -982,7 +1043,7 @@ def extract_touched(wt: Path) -> tuple[list, list]:
         src = f.read_text(errors="ignore")
         m = _PREFIX_RE.search(src)
         prefix = m.group(1) if m else ""
-        diff = subprocess.run(["git", "-C", str(wt), "diff", "-U2", BASE_BRANCH, "--", p],
+        diff = subprocess.run(["git", "-C", str(wt), "diff", "-U2", base, "--", p],
                               capture_output=True, text=True).stdout
         found = {prefix + dm.group(1)
                  for dm in _ROUTE_DECOR_RE.finditer(diff) if prefix + dm.group(1)}
@@ -1004,6 +1065,14 @@ def _git(cwd: Path, args: list) -> bool:
         log(f"  git {' '.join(args[:2])} failed: {r.stderr.strip()[:200]}")
         return False
     return True
+
+
+def _has_remote() -> bool:
+    """True if the configured REMOTE exists. direct_main only pushes to a remote
+    when one is present; greenfield projects have none and stay local."""
+    r = subprocess.run(["git", "-C", str(MAIN_CHECKOUT), "remote", "get-url", REMOTE],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
 def create_pr(branch: str, title: str, body: str) -> str:

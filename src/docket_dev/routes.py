@@ -224,6 +224,27 @@ def submit_for_processing(ticket_id: int, body: SubmitIn,
     return {"ticket": _detail(ticket_id)}
 
 
+@router.post("/build/run")
+def run_full_build(tester: dict = Depends(require_tester)):
+    """Run Full Build: submit every Discussion ticket into the queue IN BUILD ORDER
+    (build_seq, then id). Each entry to 'queued' stamps an increasing queue_seq, so
+    the agent works them through the pipeline in build order — greenfield projects
+    assemble on the base branch ticket-by-ticket. On a `/build/…` path so it never
+    collides with the `/{ticket_id}` routes."""
+    backlog = dk.list_tickets("discussion")
+    backlog.sort(key=lambda t: (t.get("build_seq") if t.get("build_seq") is not None
+                                else 10_000, t["id"]))
+    queued = 0
+    for t in backlog:
+        try:
+            dk.transition(t["id"], "queued", actor=tester.get("name", ""),
+                          summary="Run Full Build")
+            queued += 1
+        except ValueError:
+            continue  # e.g. a ticket that can't currently be queued — skip it
+    return {"queued": queued, "total": len(backlog)}
+
+
 class TransitionIn(BaseModel):
     to_status: str
     summary: str = ""
