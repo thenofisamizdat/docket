@@ -48,6 +48,7 @@ export const api = {
   board: () => req('/api/tickets/board'),
   ticket: (id) => req(`/api/tickets/${id}`),
   create: (body) => req('/api/tickets', { method: 'POST', body: JSON.stringify(body) }),
+  bulk: (tickets) => req('/api/tickets/bulk', { method: 'POST', body: JSON.stringify({ tickets }) }),
   patch: (id, body) => req(`/api/tickets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   roadmapPatch: (id, body) => req(`/api/roadmap/tickets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   toPipeline: (id, queue) => req(`/api/roadmap/tickets/${id}/pipeline`, { method: 'POST', body: JSON.stringify({ queue: !!queue }) }),

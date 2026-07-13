@@ -100,8 +100,9 @@
   .modal h2{margin:0 0 14px;font-size:16px}
   .modal label{display:block;color:var(--dim);font-size:11.5px;margin:10px 0 4px;
                text-transform:uppercase;letter-spacing:.5px}
-  .modal input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);
-               border-radius:8px;padding:8px 10px;font-size:13.5px}
+  .modal input,.modal select,.modal textarea{width:100%;background:var(--bg);border:1px solid var(--line);
+               color:var(--text);border-radius:8px;padding:8px 10px;font-size:13.5px;resize:vertical}
+  .modal .fld{display:block;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 4px}
   .modal .err{color:var(--bad);font-size:12px;min-height:16px;margin-top:8px}
   .modal button{width:100%;margin-top:12px}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
@@ -157,6 +158,7 @@
   <div class="counter remaining"><b id="hoursLeft">–</b><small>hrs to completion</small></div>
   <div class="counter scope"><b id="scopeTotal">–</b><small>hrs committed</small></div>
   <div class="counter done"><b id="hoursDone">–</b><small>hrs done</small></div>
+  <button id="newTicketBtn" class="primary" title="Create a new ticket">+ New ticket</button>
   <button id="estimateBtn" title="Auto-estimate every ticket that has no estimate yet">✨ Auto-estimate</button>
   <button id="rolloverBtn" title="Bump everything unfinished in expired weeks into the current week">Roll over week</button>
   <button id="cycleBtn">New cycle…</button>
@@ -599,6 +601,27 @@ function unestimatedCount(){
   for (const k in (BOARD?.lanes || {})) for (const t of BOARD.lanes[k])
     if (t.estimate_hours == null && !isDone(t) && t.status !== "cancelled") n++;
   return n;
+}
+document.getElementById("newTicketBtn").addEventListener("click", () => {
+  openModal("New ticket", `
+    <label class="fld">Title</label><input id="ntTitle" placeholder="Short, specific title">
+    <label class="fld">Type</label><select id="ntType"><option value="feature">Feature</option><option value="bug">Bug</option></select>
+    <label class="fld">Priority</label><select id="ntPriority"><option>P0</option><option>P1</option><option selected>P2</option><option>P3</option></select>
+    <label class="fld">Description</label><textarea id="ntDesc" rows="3" placeholder="What & why"></textarea>
+    <div class="err" id="ntErr"></div>`,
+    [{label:"Cancel", cls:"", fn: closeModal}, {label:"Create", cls:"primary", fn: createTicket}]);
+  setTimeout(() => document.getElementById("ntTitle")?.focus(), 30);
+});
+async function createTicket(){
+  const title = document.getElementById("ntTitle").value.trim();
+  if (!title){ document.getElementById("ntErr").textContent = "Title is required"; return; }
+  const body = { title, type: document.getElementById("ntType").value,
+    priority: document.getElementById("ntPriority").value,
+    description: document.getElementById("ntDesc").value };
+  try {
+    const d = await api("/api/tickets", {method:"POST", body:JSON.stringify(body)});
+    closeModal(); toast(`${d.ticket.ref} created`); load();
+  } catch(err){ document.getElementById("ntErr").textContent = err.message; }
 }
 document.getElementById("estimateBtn").addEventListener("click", async () => {
   const n = unestimatedCount();

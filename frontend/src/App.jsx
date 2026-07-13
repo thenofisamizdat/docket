@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle, CalendarRange, Rocket } from 'lucide-react'
+import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle, CalendarRange, Rocket, Upload } from 'lucide-react'
 import { api, getToken, getName, clearSession } from './api.js'
 import Login from './components/Login.jsx'
 import Board from './components/Board.jsx'
@@ -9,6 +9,7 @@ import Profiles from './components/Profiles.jsx'
 import Help from './components/Help.jsx'
 import TicketDetail from './components/TicketDetail.jsx'
 import NewTicketModal from './components/NewTicketModal.jsx'
+import BulkUpload from './components/BulkUpload.jsx'
 
 export default function App() {
   const [authed, setAuthed] = useState(!!getToken())
@@ -24,6 +25,7 @@ export default function App() {
     return p ? parseInt(p, 10) : null
   })
   const [showNew, setShowNew] = useState(false)
+  const [showBulk, setShowBulk] = useState(false)
   const [newPrefill, setNewPrefill] = useState(null)
   const [err, setErr] = useState('')
 
@@ -93,6 +95,10 @@ export default function App() {
           </a>
         </nav>
         <div className="ml-auto flex items-center gap-2">
+          <button onClick={() => setShowBulk(true)}
+            className="flex items-center gap-1 px-3 py-1.5 border border-slate-300 text-slate-600 hover:bg-slate-50 rounded-lg text-sm font-medium" title="Bulk upload tickets">
+            <Upload className="w-4 h-4" /> Bulk
+          </button>
           <button onClick={() => openNewTicket()}
             className="flex items-center gap-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium">
             <Plus className="w-4 h-4" /> New ticket
@@ -147,6 +153,10 @@ export default function App() {
           onClose={() => { setShowNew(false); setNewPrefill(null) }}
           onCreated={(t) => { setShowNew(false); setNewPrefill(null); loadBoard(); setView('board'); setOpenId(t.id) }}
         />
+      )}
+
+      {showBulk && (
+        <BulkUpload onClose={() => setShowBulk(false)} onDone={loadBoard} />
       )}
     </div>
   )

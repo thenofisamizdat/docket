@@ -29,7 +29,7 @@ Endpoints:
     POST /api/tickets/{id}/comment     → add a comment to the timeline
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -157,6 +157,30 @@ def create_ticket(body: TicketIn, tester: dict = Depends(require_tester)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ticket": t}
+
+
+class BulkIn(BaseModel):
+    tickets: List[TicketIn]
+
+
+@router.post("/bulk")
+def bulk_create(body: BulkIn, tester: dict = Depends(require_tester)):
+    """Create many tickets at once (bulk upload). Bad rows are skipped and
+    reported rather than failing the whole batch."""
+    created, errors = [], []
+    for i, row in enumerate(body.tickets):
+        if not (row.title or "").strip():
+            errors.append({"row": i + 1, "error": "title is required"})
+            continue
+        try:
+            t = dk.create_ticket(
+                title=row.title, type=row.type, description=row.description,
+                acceptance_criteria=row.acceptance_criteria, priority=row.priority,
+                created_by=tester.get("name", ""))
+            created.append({"ref": t["ref"], "id": t["id"], "title": t["title"]})
+        except ValueError as e:
+            errors.append({"row": i + 1, "title": row.title, "error": str(e)})
+    return {"created": created, "errors": errors, "count": len(created)}
 
 
 # ---- single ticket ----

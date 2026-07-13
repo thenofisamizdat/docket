@@ -1,13 +1,53 @@
-import React, { useEffect, useState } from 'react'
-import { AlertCircle, RefreshCw } from 'lucide-react'
+import React, { useEffect, useMemo, useState } from 'react'
+import { AlertCircle, ChevronDown, ChevronRight, Columns2 } from 'lucide-react'
 import { api } from '../api.js'
 import { fmtDuration } from '../ui.js'
 
-// Coaching dashboard (Phase 4): make throughput, effort, and ask-quality legible
-// so testers learn what good stories cost — and where vague ones bounce.
+// Analytics — a sliceable dashboard. The backend returns a per-ticket dataset
+// (`a.tickets`); everything here filters/aggregates/compares it CLIENT-SIDE, so
+// any filter or side-by-side is instant.
+
+const isDone = (r) => r.status === 'done' || r.roadmap_status === 'done'
+
+const EMPTY_FILTER = { type: 'all', status: 'all', assignee: 'all', source: 'all', days: 'all' }
+
+function applyFilters(rows, f) {
+  return rows.filter((r) => {
+    if (f.type !== 'all' && r.type !== f.type) return false
+    if (f.source === 'automated' && !r.is_automated) return false
+    if (f.source === 'manual' && r.is_automated) return false
+    if (f.status === 'open' && isDone(r)) return false
+    if (f.status === 'done' && !isDone(r)) return false
+    if (f.assignee !== 'all' && (r.assignee || r.created_by || '') !== f.assignee) return false
+    if (f.days !== 'all' && (!r.created_at || Date.parse(r.created_at) < Date.now() - f.days * 86400000)) return false
+    return true
+  })
+}
+
+function agg(rows) {
+  const done = rows.filter(isDone)
+  const cyc = done.map((r) => r.cycle_secs).filter((x) => x != null)
+  const vr = rows.filter((r) => r.verified != null)
+  const sum = (k) => rows.reduce((s, r) => s + (r[k] || 0), 0)
+  return {
+    n: rows.length, done: done.length, open: rows.length - done.length,
+    auto: rows.filter((r) => r.is_automated).length,
+    man: rows.filter((r) => !r.is_automated).length,
+    avgCycle: cyc.length ? cyc.reduce((a, b) => a + b, 0) / cyc.length : null,
+    cost: sum('cost_usd'), agentSecs: sum('agent_secs'), humanHrs: sum('hours_done'),
+    verifiedPct: vr.length ? Math.round(rows.filter((r) => r.verified === true).length / vr.length * 100) : null,
+    reworkPct: rows.length ? Math.round(rows.filter((r) => r.iteration > 0).length / rows.length * 100) : 0,
+  }
+}
+
+const fmtH = (secs) => (secs ? `${(secs / 3600).toFixed(1)}h` : '0h')
+
 export default function Analytics() {
   const [a, setA] = useState(null)
   const [err, setErr] = useState('')
+  const [filter, setFilter] = useState(EMPTY_FILTER)
+  const [compare, setCompare] = useState(false)
+  const [filterB, setFilterB] = useState({ ...EMPTY_FILTER, source: 'manual' })
 
   useEffect(() => {
     const load = () => api.analytics().then(setA).catch((e) => setErr(e.message))
@@ -16,141 +56,197 @@ export default function Analytics() {
     return () => clearInterval(iv)
   }, [])
 
+  const rows = a?.tickets || []
+  const assignees = useMemo(() => {
+    const s = new Set()
+    rows.forEach((r) => { if (r.assignee) s.add(r.assignee); else if (r.created_by) s.add(r.created_by) })
+    return [...s].sort()
+  }, [rows])
+  const filtered = useMemo(() => applyFilters(rows, filter), [rows, filter])
+
   if (err) return <div className="p-6 text-red-600 text-sm">{err}</div>
   if (!a) return <div className="p-6 text-slate-400">Loading analytics…</div>
 
   const clar = a.clarity.distribution
   const clarTotal = clar.low + clar.medium + clar.high
-  const pipe = a.pipeline
-  const vTotal = pipe ? pipe.verified + pipe.unverified : 0
-  const verifiedPct = vTotal ? Math.round((pipe.verified / vTotal) * 100) : 0
-  const pretty = (s) => (s || '').replace(/_/g, ' ')
+  const auto = filtered.filter((r) => r.is_automated)
+  const man = filtered.filter((r) => !r.is_automated)
 
   return (
     <div className="max-w-5xl mx-auto p-4 space-y-4">
-      {/* Top metric cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Stat label="Tickets" value={a.totals.total} sub={`${a.totals.done} done · ${a.totals.open} open`} />
-        <Stat label="Bounce rate" value={`${a.quality.bounce_rate}%`} sub={`${a.quality.bounced_tickets} needed clarification`} tone={a.quality.bounce_rate > 25 ? 'warn' : 'ok'} />
-        <Stat label="Avg effort / ticket" value={fmtDuration(a.effort.avg_secs) || '—'} sub={`$${a.effort.avg_cost_usd} avg`} />
-        <Stat label="Total agent cost" value={`$${a.effort.total_cost_usd}`} sub={`${fmtDuration(a.effort.total_secs)} compute · ${a.quality.resubmits} resubmits`} />
+      {/* Filter bar */}
+      <div className="flex flex-wrap items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 sticky top-0 z-10">
+        <FilterControls f={filter} set={setFilter} assignees={assignees} />
+        <span className="text-[11px] text-slate-400">{filtered.length} of {rows.length} tickets</span>
+        <div className="flex-1" />
+        {filter !== EMPTY_FILTER && (
+          <button onClick={() => setFilter(EMPTY_FILTER)} className="text-[11px] text-slate-500 hover:text-slate-700">clear</button>)}
+        <button onClick={() => setCompare((c) => !c)}
+          className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium border ${compare ? 'bg-indigo-600 text-white border-indigo-600' : 'border-slate-300 text-slate-600 hover:bg-slate-50'}`}>
+          <Columns2 className="w-3.5 h-3.5" /> Compare
+        </button>
       </div>
 
-      {/* Pipeline analytics */}
-      {pipe && (
-        <Card title="Pipeline" hint="Automated development — throughput, cost, cycle time, quality & flow">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-            <Stat label="Shipped" value={pipe.cycle_count} sub="done by the agent" />
-            <Stat label="Avg cycle time" value={fmtDuration(pipe.avg_cycle_secs) || '—'} sub="created → done" />
-            <Stat label="Verified" value={`${verifiedPct}%`} sub={`${pipe.verified} verified · ${pipe.unverified} not`} tone={vTotal && verifiedPct < 60 ? 'warn' : undefined} />
-            <Stat label="Rework rate" value={`${pipe.rework_rate}%`} sub={`${a.quality.failed_review} needed a redo`} tone={pipe.rework_rate > 25 ? 'warn' : undefined} />
-          </div>
-          <div className="grid md:grid-cols-2 gap-4">
-            <div>
-              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Throughput / day</div>
-              <MiniBars data={pipe.throughput_by_day} color="#3fb96a" fmt={(v) => `${v} shipped`} />
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Agent cost / day</div>
-              <Spark data={pipe.cost_by_day} color="#4f8cff" fmt={(v) => `$${v}`} />
-            </div>
-          </div>
-          <div className="grid md:grid-cols-2 gap-4 mt-4">
-            <div>
-              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Avg time in stage</div>
-              <HBars items={pipe.time_in_stage.map((s) => ({ label: pretty(s.status), value: s.avg_secs, hint: fmtDuration(s.avg_secs) }))} color="#4f8cff" />
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Work in progress</div>
-              <HBars items={Object.entries(pipe.wip).filter(([, v]) => v).map(([k, v]) => ({ label: pretty(k), value: v, hint: `${v}` }))} color="#e0a83c" empty="Nothing in the pipeline right now." />
-            </div>
-          </div>
-          {pipe.estimate_vs_actual.length > 0 && (
-            <div className="mt-4">
-              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Estimate vs actual (pipeline-built)</div>
-              <table className="w-full text-sm">
-                <tbody>
-                  {pipe.estimate_vs_actual.slice(0, 8).map((e) => (
-                    <tr key={e.ref} className="border-t border-slate-100">
-                      <td className="py-1 font-mono text-[11px] text-slate-400">{e.ref}</td>
-                      <td className="py-1 text-right text-slate-500">est {e.estimate}h</td>
-                      <td className={`py-1 text-right ${e.actual > e.estimate ? 'text-rose-600' : 'text-emerald-600'}`}>actual {e.actual}h</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-      )}
-
-      {/* Ask clarity */}
-      <Card title="Ask clarity" hint="Quality of the stories testers write (scored at submit)">
-        <div className="flex items-center gap-4">
-          <div className="text-3xl font-semibold text-slate-800 w-20">{a.clarity.avg ?? '—'}<span className="text-base text-slate-400">/100</span></div>
-          <div className="flex-1">
-            {clarTotal === 0
-              ? <div className="text-sm text-slate-400 italic">No scored tickets yet — new tickets get a clarity score.</div>
-              : <div className="flex h-4 rounded-full overflow-hidden">
-                  <Seg n={clar.high} total={clarTotal} cls="bg-emerald-500" label="high" />
-                  <Seg n={clar.medium} total={clarTotal} cls="bg-amber-400" label="medium" />
-                  <Seg n={clar.low} total={clarTotal} cls="bg-rose-500" label="low" />
-                </div>}
-            <div className="flex gap-3 mt-1 text-[11px] text-slate-500">
-              <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1" />High {clar.high}</span>
-              <span><span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1" />Medium {clar.medium}</span>
-              <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1" />Low {clar.low}</span>
-            </div>
-          </div>
+      {compare ? (
+        <div className="grid md:grid-cols-2 gap-3">
+          <CompareColumn label="A" f={filter} set={setFilter} assignees={assignees} rows={applyFilters(rows, filter)} />
+          <CompareColumn label="B" f={filterB} set={setFilterB} assignees={assignees} rows={applyFilters(rows, filterB)} />
         </div>
-      </Card>
+      ) : (
+        <>
+          {/* Summary tiles (respect the filter) */}
+          <StatRow rows={filtered} />
 
-      {/* Per-tester coaching table */}
-      <Card title="By tester" hint="Who writes the clearest asks, and whose bounce / iterate most">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-[11px] uppercase text-slate-400">
-              <th className="py-1">Tester</th>
-              <th className="py-1 text-right">Tickets</th>
-              <th className="py-1 text-right">Avg clarity</th>
-              <th className="py-1 text-right">Bounced</th>
-              <th className="py-1 text-right">Resubmits</th>
-            </tr>
-          </thead>
-          <tbody>
-            {a.per_author.map((r) => (
-              <tr key={r.author} className="border-t border-slate-100">
-                <td className="py-1.5 font-medium text-slate-700">{r.author}</td>
-                <td className="py-1.5 text-right">{r.tickets}</td>
-                <td className="py-1.5 text-right">{r.avg_clarity ?? '—'}</td>
-                <td className={`py-1.5 text-right ${r.bounced ? 'text-rose-600' : 'text-slate-400'}`}>{r.bounced}</td>
-                <td className={`py-1.5 text-right ${r.iterations ? 'text-amber-600' : 'text-slate-400'}`}>{r.iterations}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Card>
+          {/* Automated vs manual */}
+          <Card title="Automated vs Manual" hint="Pipeline-built tickets vs those worked by hand — effort & rates">
+            <div className="grid grid-cols-3 text-sm">
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 py-1" />
+              <div className="text-center text-xs font-semibold text-indigo-600 py-1">🤖 Automated</div>
+              <div className="text-center text-xs font-semibold text-slate-600 py-1">✋ Manual</div>
+              <CmpRow label="Tickets" a={auto.length} b={man.length} />
+              <CmpRow label="Done" a={auto.filter(isDone).length} b={man.filter(isDone).length} />
+              <CmpRow label="Avg cycle time" a={fmtCycle(agg(auto).avgCycle)} b={fmtCycle(agg(man).avgCycle)} />
+              <CmpRow label="Effort" a={`${fmtH(agg(auto).agentSecs)} · $${agg(auto).cost.toFixed(2)}`} b={`${agg(man).humanHrs.toFixed(1)}h logged`} />
+              <CmpRow label="Verified" a={agg(auto).verifiedPct != null ? `${agg(auto).verifiedPct}%` : '—'} b="—" />
+              <CmpRow label="Rework rate" a={`${agg(auto).reworkPct}%`} b={`${agg(man).reworkPct}%`} />
+            </div>
+          </Card>
 
-      {/* Recently bounced & why */}
-      <Card title="Bounced & why" hint="Where asks needed clarification or failed review — the coaching gold">
-        {a.recently_bounced.length === 0
-          ? <div className="text-sm text-slate-400 italic">Nothing bounced yet.</div>
-          : <ul className="space-y-2">
-              {a.recently_bounced.map((b, i) => (
-                <li key={i} className="flex gap-2 text-sm">
-                  <AlertCircle className={`w-4 h-4 mt-0.5 shrink-0 ${b.kind === 'needs_info' ? 'text-rose-500' : 'text-amber-500'}`} />
-                  <div>
-                    <span className="font-mono text-[11px] text-slate-400 mr-1">{b.ref}</span>
-                    <span className="text-slate-700">{b.title}</span>
-                    <span className="ml-1 text-[10px] uppercase text-slate-400">{b.kind === 'needs_info' ? 'needs info' : 'resubmit'}</span>
-                    <div className="text-xs text-slate-500">{b.reason}</div>
-                  </div>
-                </li>
-              ))}
-            </ul>}
-      </Card>
+          {/* By type + by assignee */}
+          <div className="grid md:grid-cols-2 gap-3">
+            <Card title="By type">
+              <HBars items={splitBy(filtered, 'type').map(([k, v]) => ({ label: k, value: v.length, hint: `${v.length}` }))} color="#6366f1" empty="No tickets." />
+            </Card>
+            <Card title="By assignee" hint="tickets owned (done / total)">
+              <HBars items={byAssignee(filtered)} color="#4f8cff" empty="Unassigned." />
+            </Card>
+          </div>
+
+          {/* Pipeline flow (global time-series) */}
+          {a.pipeline && (
+            <Card title="Pipeline flow" hint="Throughput, cost & stage timing across the whole pipeline" collapsible>
+              <div className="grid md:grid-cols-2 gap-4">
+                <Labelled t="Throughput / day"><MiniBars data={a.pipeline.throughput_by_day} color="#3fb96a" fmt={(v) => `${v} shipped`} /></Labelled>
+                <Labelled t="Agent cost / day"><Spark data={a.pipeline.cost_by_day} color="#4f8cff" fmt={(v) => `$${v}`} /></Labelled>
+                <Labelled t="Avg time in stage"><HBars items={a.pipeline.time_in_stage.map((s) => ({ label: s.status.replace(/_/g, ' '), value: s.avg_secs, hint: fmtDuration(s.avg_secs) }))} color="#4f8cff" /></Labelled>
+                <Labelled t="Work in progress"><HBars items={Object.entries(a.pipeline.wip).filter(([, v]) => v).map(([k, v]) => ({ label: k.replace(/_/g, ' '), value: v, hint: `${v}` }))} color="#e0a83c" empty="Nothing in flight." /></Labelled>
+              </div>
+            </Card>
+          )}
+
+          {/* Ask clarity */}
+          <Card title="Ask clarity" hint="Quality of the stories testers write (scored at submit)" collapsible>
+            <div className="flex items-center gap-4">
+              <div className="text-3xl font-semibold text-slate-800 w-20">{a.clarity.avg ?? '—'}<span className="text-base text-slate-400">/100</span></div>
+              <div className="flex-1">
+                {clarTotal === 0
+                  ? <div className="text-sm text-slate-400 italic">No scored tickets yet.</div>
+                  : <div className="flex h-4 rounded-full overflow-hidden">
+                      <Seg n={clar.high} total={clarTotal} cls="bg-emerald-500" label="high" />
+                      <Seg n={clar.medium} total={clarTotal} cls="bg-amber-400" label="medium" />
+                      <Seg n={clar.low} total={clarTotal} cls="bg-rose-500" label="low" />
+                    </div>}
+                <div className="flex gap-3 mt-1 text-[11px] text-slate-500">
+                  <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1" />High {clar.high}</span>
+                  <span><span className="inline-block w-2 h-2 rounded-full bg-amber-400 mr-1" />Medium {clar.medium}</span>
+                  <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1" />Low {clar.low}</span>
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          {/* Bounced & why */}
+          <Card title="Bounced & why" hint="Where asks needed clarification or failed review" collapsible defaultOpen={false}>
+            {a.recently_bounced.length === 0
+              ? <div className="text-sm text-slate-400 italic">Nothing bounced yet.</div>
+              : <ul className="space-y-2">
+                  {a.recently_bounced.map((b, i) => (
+                    <li key={i} className="flex gap-2 text-sm">
+                      <AlertCircle className={`w-4 h-4 mt-0.5 shrink-0 ${b.kind === 'needs_info' ? 'text-rose-500' : 'text-amber-500'}`} />
+                      <div>
+                        <span className="font-mono text-[11px] text-slate-400 mr-1">{b.ref}</span>
+                        <span className="text-slate-700">{b.title}</span>
+                        <div className="text-xs text-slate-500">{b.reason}</div>
+                      </div>
+                    </li>
+                  ))}
+                </ul>}
+          </Card>
+        </>
+      )}
     </div>
   )
+}
+
+function fmtCycle(secs) { return secs != null ? fmtDuration(secs) : '—' }
+
+function splitBy(rows, key) {
+  const m = {}
+  rows.forEach((r) => { (m[r[key] || '—'] ||= []).push(r) })
+  return Object.entries(m).sort((a, b) => b[1].length - a[1].length)
+}
+function byAssignee(rows) {
+  const m = {}
+  rows.forEach((r) => { const who = r.assignee || r.created_by || 'unassigned'; (m[who] ||= []).push(r) })
+  return Object.entries(m).sort((a, b) => b[1].length - a[1].length)
+    .map(([who, rs]) => ({ label: who, value: rs.length, hint: `${rs.filter(isDone).length}/${rs.length}` }))
+}
+
+function StatRow({ rows }) {
+  const g = agg(rows)
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <Stat label="Tickets" value={g.n} sub={`${g.done} done · ${g.open} open`} />
+      <Stat label="Avg cycle time" value={fmtCycle(g.avgCycle)} sub="created → done" />
+      <Stat label="Agent cost" value={`$${g.cost.toFixed(2)}`} sub={`${fmtH(g.agentSecs)} compute`} />
+      <Stat label="Verified" value={g.verifiedPct != null ? `${g.verifiedPct}%` : '—'} sub={`${g.reworkPct}% rework`} tone={g.verifiedPct != null && g.verifiedPct < 60 ? 'warn' : undefined} />
+    </div>
+  )
+}
+
+function CompareColumn({ label, f, set, assignees, rows }) {
+  return (
+    <div className="border border-slate-200 rounded-xl p-3 space-y-3 bg-white">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold text-slate-400">{label}</span>
+        <div className="flex flex-wrap gap-1.5"><FilterControls f={f} set={set} assignees={assignees} compact /></div>
+      </div>
+      <StatRow rows={rows} />
+      <HBars items={splitBy(rows, 'type').map(([k, v]) => ({ label: k, value: v.length, hint: `${v.length}` }))} color="#6366f1" empty="No tickets." />
+    </div>
+  )
+}
+
+function CmpRow({ label, a, b }) {
+  return (
+    <>
+      <div className="text-slate-500 py-1.5 border-t border-slate-100">{label}</div>
+      <div className="text-center text-slate-800 py-1.5 border-t border-slate-100 font-medium">{a}</div>
+      <div className="text-center text-slate-800 py-1.5 border-t border-slate-100 font-medium">{b}</div>
+    </>
+  )
+}
+
+const SEL = 'text-xs bg-white border border-slate-200 rounded-lg px-2 py-1 text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-200'
+function FilterControls({ f, set, assignees, compact }) {
+  const on = (k) => (e) => set({ ...f, [k]: e.target.value === 'all' ? 'all' : (k === 'days' ? Number(e.target.value) : e.target.value) })
+  return (
+    <>
+      <select className={SEL} value={f.type} onChange={on('type')}><option value="all">All types</option><option value="feature">Feature</option><option value="bug">Bug</option></select>
+      <select className={SEL} value={f.source} onChange={on('source')}><option value="all">All sources</option><option value="automated">Automated</option><option value="manual">Manual</option></select>
+      <select className={SEL} value={f.status} onChange={on('status')}><option value="all">Any status</option><option value="open">Open</option><option value="done">Done</option></select>
+      {!compact && (
+        <select className={SEL} value={f.assignee} onChange={on('assignee')}>
+          <option value="all">Anyone</option>
+          {assignees.map((x) => <option key={x} value={x}>{x}</option>)}
+        </select>)}
+      <select className={SEL} value={f.days} onChange={on('days')}><option value="all">All time</option><option value="7">Last 7d</option><option value="30">Last 30d</option></select>
+    </>
+  )
+}
+
+function Labelled({ t, children }) {
+  return <div><div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">{t}</div>{children}</div>
 }
 
 function Stat({ label, value, sub, tone }) {
@@ -163,14 +259,18 @@ function Stat({ label, value, sub, tone }) {
   )
 }
 
-function Card({ title, hint, children }) {
+function Card({ title, hint, children, collapsible, defaultOpen = true }) {
+  const [open, setOpen] = useState(defaultOpen)
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <div className="mb-3">
-        <h3 className="text-sm font-semibold text-slate-800">{title}</h3>
-        {hint && <p className="text-[11px] text-slate-400">{hint}</p>}
+      <div className={`mb-3 ${collapsible ? 'cursor-pointer' : ''}`} onClick={collapsible ? () => setOpen((o) => !o) : undefined}>
+        <div className="flex items-center gap-1.5">
+          {collapsible && (open ? <ChevronDown className="w-4 h-4 text-slate-400" /> : <ChevronRight className="w-4 h-4 text-slate-400" />)}
+          <h3 className="text-sm font-semibold text-slate-800">{title}</h3>
+        </div>
+        {hint && open && <p className="text-[11px] text-slate-400 ml-5">{hint}</p>}
       </div>
-      {children}
+      {(!collapsible || open) && children}
     </div>
   )
 }
@@ -180,7 +280,6 @@ function Seg({ n, total, cls, label }) {
   return <div className={cls} style={{ width: `${(n / total) * 100}%` }} title={`${label}: ${n}`} />
 }
 
-// Daily bars (throughput). Inline SVG, no chart lib — matches Profiles.jsx idiom.
 function MiniBars({ data, color, fmt }) {
   if (!data || !data.length) return <Empty>No data yet.</Empty>
   const W = 320, H = 72, pad = 4
@@ -197,7 +296,6 @@ function MiniBars({ data, color, fmt }) {
   )
 }
 
-// Daily line (cost). Inline SVG polyline + point tooltips.
 function Spark({ data, color, fmt }) {
   if (!data || !data.length) return <Empty>No data yet.</Empty>
   const W = 320, H = 72, pad = 5
@@ -210,15 +308,12 @@ function Spark({ data, color, fmt }) {
     <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 72 }}>
       {n > 1 && <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />}
       {data.map((d, i) => (
-        <circle key={i} cx={x(i)} cy={y(d.value)} r="3" fill={color}>
-          <title>{`${d.date}: ${fmt ? fmt(d.value) : d.value}`}</title>
-        </circle>
+        <circle key={i} cx={x(i)} cy={y(d.value)} r="3" fill={color}><title>{`${d.date}: ${fmt ? fmt(d.value) : d.value}`}</title></circle>
       ))}
     </svg>
   )
 }
 
-// Horizontal magnitude bars (time-in-stage, WIP).
 function HBars({ items, color, empty }) {
   if (!items || !items.length) return <Empty>{empty || 'No data yet.'}</Empty>
   const max = Math.max(1, ...items.map((i) => i.value))

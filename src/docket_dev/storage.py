@@ -919,7 +919,55 @@ def analytics() -> Dict[str, Any]:
         "wip": {s: by_status.get(s, 0) for s in MAIN_LINE if s != "done"},
     }
 
+    # ---- per-ticket enriched dataset: the frontend filters / aggregates / compares
+    # this client-side (any slice or side-by-side is instant, no endpoint per filter). ----
+    agg = _dd(lambda: {"secs": 0.0, "cost": 0.0, "turns": 0})
+    notes_by = _dd(list)
+    for e in evs:
+        p = _pl(e)
+        if p:
+            a = agg[e["ticket_id"]]
+            a["secs"] += float(p.get("duration_secs") or 0)
+            a["cost"] += float(p.get("cost_usd") or 0)
+            a["turns"] += int(p.get("turns") or 0)
+        if e["kind"] == "note":
+            notes_by[e["ticket_id"]].append(str(e.get("summary") or ""))
+
+    def _verified(tid):
+        blob = " ".join(notes_by.get(tid, []))
+        if "NOT agent-verified" in blob or "could NOT verify" in blob:
+            return False
+        if "agent-verified" in blob or "Verified —" in blob:
+            return True
+        return None
+
+    ticket_rows = []
+    for t in tickets:
+        tid = t["id"]
+        a = agg.get(tid) or {"secs": 0.0, "cost": 0.0, "turns": 0}
+        dts = done_ts.get(tid)
+        cs = None
+        if dts:
+            c, d = _epoch(t.get("created_at")), _epoch(dts)
+            if c and d and d >= c:
+                cs = round(d - c)
+        ticket_rows.append({
+            "id": tid, "ref": ticket_ref(tid), "title": t.get("title", ""),
+            "type": t.get("type"), "status": t.get("status"), "priority": t.get("priority"),
+            "assignee": t.get("assignee") or "", "created_by": t.get("created_by") or "",
+            "created_at": t.get("created_at"), "updated_at": t.get("updated_at"),
+            "done_ts": dts, "cycle_secs": cs,
+            "agent_secs": round(a["secs"]), "cost_usd": round(a["cost"], 4), "turns": a["turns"],
+            "is_automated": a["secs"] > 0,      # the agent ran on it (has run-events)
+            "hours_done": t.get("hours_done"), "estimate_hours": t.get("estimate_hours"),
+            "roadmap_status": t.get("roadmap_status"), "week_lane": t.get("week_lane"),
+            "iteration": int(t.get("iteration") or 0),
+            "clarity_score": t.get("clarity_score"), "clarity_level": t.get("clarity_level"),
+            "verified": _verified(tid),
+        })
+
     return {
+        "tickets": ticket_rows,
         "totals": {"total": total, "done": done, "open": total - done, "by_status": by_status},
         "effort": {"total_cost_usd": round(cost, 2), "total_secs": round(secs),
                    "tickets_with_effort": len(eff_tickets),
