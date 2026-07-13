@@ -1350,14 +1350,16 @@ def auto_deploy_tick() -> None:
     if DEPLOY_CMD:
         log(f"auto-deploy: {state['last_sha'][:7]} → {after[:7]}, running deploy cmd")
         try:
+            # Real deploy scripts install deps / rebuild containers / run
+            # migrations / health-check — give them 30 minutes, not 10.
             r = subprocess.run(DEPLOY_CMD, shell=True, cwd=str(root),
-                               capture_output=True, text=True, timeout=600)
+                               capture_output=True, text=True, timeout=1800)
             entry["cmd_rc"] = r.returncode
             entry["cmd_tail"] = ((r.stdout or "") + (r.stderr or ""))[-600:]
             entry["ok"] = r.returncode == 0
         except subprocess.TimeoutExpired:
             entry["ok"] = False
-            entry["cmd_tail"] = "deploy command timed out after 600s"
+            entry["cmd_tail"] = "deploy command timed out after 1800s"
     else:
         entry["ok"] = True   # pull-only deploy (e.g. a dev server watching the tree)
         log(f"auto-deploy: updated {state['last_sha'][:7]} → {after[:7]} (no deploy cmd)")
