@@ -141,15 +141,18 @@ def cmd_init(args) -> int:
     storage.init_db()
 
     # Register with the service control plane so this repo shows on the dashboard.
+    # The id must stay slug-derived (it maps to the systemd unit names); --name
+    # only sets the display name on the hub.
+    display_name = (args.name or "").strip() or slug or root.name
     try:
         from docket_dev import service
         service.register_project(
-            id=service.unit_slug(slug or root.name), name=slug or root.name,
+            id=service.unit_slug(slug or root.name), name=display_name,
             kind="existing", root=str(root), port=port, dev_mode=args.dev_mode)
     except Exception as e:
         print(f"  (note: could not register with the service dashboard: {e})")
 
-    print(f"Docket initialized for {slug or root.name}")
+    print(f"Docket initialized for {display_name}")
     print(f"  config:  {out}")
     print(f"  repo:    {root}  (branch {branch}, remote {remote})")
     print(f"  login:   {username} / {password}")
@@ -640,6 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pi = sub.add_parser("init", help="initialize Docket in the current repo")
     pi.add_argument("path", nargs="?", help="repo path (default: cwd)")
+    pi.add_argument("--name", help="display name on the hub (default: repo slug or folder name)")
     pi.add_argument("--slug", help="GitHub owner/name (default: detect from remote)")
     pi.add_argument("--remote", default="origin")
     pi.add_argument("--base-branch", dest="base_branch", help="default: detect")

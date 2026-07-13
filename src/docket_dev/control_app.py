@@ -237,6 +237,7 @@ def validate_path(body: PathIn, admin: dict = Depends(require_admin)):
 
 class InitProjectIn(BaseModel):
     path: str
+    name: str = ""           # display name on the hub (default: repo slug / folder name)
     dev_mode: str = "pr"
     git_init: bool = False   # `git init` a plain work folder before installing
 
@@ -271,8 +272,10 @@ def init_existing(body: InitProjectIn, admin: dict = Depends(require_admin)):
         if r.returncode != 0:
             raise HTTPException(status_code=500,
                                 detail=(r.stderr or "git init failed").strip()[:300])
-    job = _start_job("init", ["docket", "init", info["path"], "--dev-mode", body.dev_mode],
-                     path=info["path"])
+    cmd = ["docket", "init", info["path"], "--dev-mode", body.dev_mode]
+    if body.name.strip():
+        cmd += ["--name", body.name.strip()]
+    job = _start_job("init", cmd, path=info["path"])
     return {"job": job}
 
 
