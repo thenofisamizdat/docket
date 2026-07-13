@@ -468,10 +468,54 @@ def cmd_service(args) -> int:
     from docket_dev.control_app import app
     host = args.host or "127.0.0.1"
     port = args.port or service.DASHBOARD_PORT
+    if getattr(args, "daemon", False):
+        return _install_service_unit(host, port)
     print(f"Docket service dashboard at http://{host}:{port}  (Ctrl-C to stop)")
     print(f"  registry: {service.PROJECTS_TOML}")
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
+
+
+def _install_service_unit(host: str, port: int) -> int:
+    """Install + start the hub as a systemd unit (docket-service.service), so
+    :8010 survives reboots instead of living in a stray terminal."""
+    import getpass
+    exe = shutil.which("docket") or str(Path(sys.executable).parent / "docket")
+    # The hub shells out to `docket` (init/groom/launch jobs), which in turn
+    # shells out to `claude` and `git` — give the unit a PATH with all of them.
+    claude = shutil.which("claude")
+    pathparts = [str(Path(exe).parent)]
+    if claude:
+        pathparts.append(str(Path(claude).parent))
+    pathparts += ["/usr/local/bin", "/usr/bin", "/bin"]
+    path = ":".join(dict.fromkeys(pathparts))
+    body = (f"[Unit]\nDescription=Docket hub — multi-project control plane\n"
+            f"After=network.target\n\n"
+            f"[Service]\nType=simple\nUser={getpass.getuser()}\n"
+            f'Environment="HOME={Path.home()}"\nEnvironment="PATH={path}"\n'
+            f"WorkingDirectory={Path.home()}\n"
+            f"ExecStart={exe} service --host {host} --port {port}\n"
+            f"Restart=on-failure\nRestartSec=5\n\n"
+            f"[Install]\nWantedBy=multi-user.target\n")
+    unit = "docket-service.service"
+    try:
+        (Path("/etc/systemd/system") / unit).write_text(body)
+    except PermissionError:
+        staged = Path.home() / ".docket" / unit
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(body)
+        print("  ! need root to install the hub service. Re-run with sudo:")
+        print(f"      sudo {exe} service --daemon --host {host} --port {port}")
+        print(f"    (unit file staged at {staged})")
+        return 1
+    _systemctl("daemon-reload")
+    # enable + restart (not `enable --now`): --now is a no-op on an already-
+    # running unit, which would leave a stale environment/ExecStart in place.
+    ok = _systemctl("enable", unit) and _systemctl("restart", unit)
+    print(f"  service: {unit}  {'started ✓' if ok else '(check status)'}")
+    print(f"  Docket hub at http://{host}:{port}")
+    print(f"  manage:  sudo systemctl {{status,restart,stop}} {unit}")
+    return 0 if ok else 1
 
 
 def cmd_projects(args) -> int:
@@ -624,9 +668,11 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--cap", type=int, default=40, help="max tickets to draft")
     pg.set_defaults(func=cmd_groom)
 
-    psvc = sub.add_parser("service", help="run the multi-project control-plane dashboard")
+    psvc = sub.add_parser("service", help="run the multi-project control-plane dashboard (the hub)")
     psvc.add_argument("--host", help="bind host (default: 127.0.0.1)")
     psvc.add_argument("--port", type=int, help="dashboard port (default: 8010)")
+    psvc.add_argument("--daemon", action="store_true",
+                      help="install + start a docket-service systemd unit instead of foreground")
     psvc.set_defaults(func=cmd_service)
 
     sub.add_parser("projects", help="list registered projects + status").set_defaults(func=cmd_projects)

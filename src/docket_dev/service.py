@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import tomllib
 from pathlib import Path
@@ -182,6 +183,77 @@ def project_status(project: Dict[str, Any]) -> str:
     if not port:
         return "unknown"
     return "running" if not _port_free(port) else "stopped"
+
+
+# ---------------------------------------------------------------------------
+# read-only views into a project's own files (config.toml / docket.db)
+#
+# The control plane may READ per-project files — they're data — it just must
+# never IMPORT per-project modules (those bind to one repo at import time).
+# ---------------------------------------------------------------------------
+
+def read_project_config(root: str | Path) -> Optional[Dict[str, Any]]:
+    """The slice of <root>/.docket/config.toml the hub needs (auth handoff +
+    display). None if the project has no package-style config (e.g. a legacy
+    standalone install)."""
+    path = Path(root) / ".docket" / "config.toml"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception:
+        return None
+    auth = data.get("auth", {}) or {}
+    server = data.get("server", {}) or {}
+    testers = [{"username": (t.get("username") or "").strip().lower(),
+                "name": t.get("name") or ""}
+               for t in (data.get("testers") or []) if t.get("username")]
+    return {
+        "jwt_secret": auth.get("jwt_secret", ""),
+        "jwt_algorithm": auth.get("jwt_algorithm", "HS256"),
+        "user_test_lead": (auth.get("user_test_lead") or "").strip().lower(),
+        "testers": testers,
+        "base_url": server.get("base_url", ""),
+    }
+
+
+_LANES = ("discussion", "queued", "in_progress", "self_review", "pr",
+          "user_review", "needs_info", "done", "cancelled")
+
+
+def project_summary(root: str | Path) -> Optional[Dict[str, Any]]:
+    """Ticket lane counts + last activity from <root>/.docket/data/docket.db,
+    read-only. None when the DB doesn't exist yet or can't be read."""
+    db = Path(root) / ".docket" / "data" / "docket.db"
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.5)
+        try:
+            rows = con.execute(
+                "SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall()
+            last = con.execute("SELECT MAX(updated_at) FROM tickets").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    counts = {status: n for status, n in rows}
+    return {"total": sum(counts.values()),
+            "counts": {k: counts.get(k, 0) for k in _LANES if counts.get(k)},
+            "last_activity": last or ""}
+
+
+def inspect_path(path: str) -> Dict[str, Any]:
+    """Pre-flight checks for installing Docket into an existing folder."""
+    p = Path(path).expanduser()
+    exists = p.is_dir()
+    is_git = exists and (p / ".git").exists()
+    has_docket = exists and (p / ".docket" / "config.toml").is_file()
+    registered = any(Path(pr.get("root", "")) == p.resolve()
+                     for pr in load_projects()) if exists else False
+    return {"path": str(p), "exists": exists, "is_git": is_git,
+            "has_docket": has_docket, "registered": registered}
 
 
 # ---------------------------------------------------------------------------

@@ -254,6 +254,15 @@
 
 <script>
 "use strict";
+// Hub handoff: ?sso=<tester-jwt> from the service hub → adopt the session
+// cookie and strip the params before the normal cookie read below.
+(function(){
+  const q = new URLSearchParams(location.search), t = q.get("sso");
+  if (!t) return;
+  document.cookie = "testing_token=" + t + "; path=/; max-age=" + 7*24*3600 + "; samesite=lax";
+  q.delete("sso"); q.delete("name");
+  history.replaceState(null, "", location.pathname + (q.toString() ? "?" + q.toString() : "") + location.hash);
+})();
 let TOKEN = null, BOARD = null, ANALYTICS = null, TICKETS = [];
 let PAFILTER = {type:'all', source:'all', status:'all', assignee:'all', days:'all'};
 

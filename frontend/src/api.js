@@ -26,6 +26,21 @@ export function clearSession() {
   document.cookie = 'testing_token=; path=/; max-age=0'
 }
 
+// Hub handoff: the service hub opens a board as /docket/?sso=<tester-jwt>&name=<n>.
+// Consume the token into the normal session and strip the params so the URL is
+// clean and the token doesn't linger in history. Module scope — runs before the
+// app's first getToken() read.
+;(function consumeSso() {
+  const params = new URLSearchParams(window.location.search)
+  const sso = params.get('sso')
+  if (!sso) return
+  setSession(sso, params.get('name') || '')
+  params.delete('sso')
+  params.delete('name')
+  const qs = params.toString()
+  window.history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash)
+})()
+
 async function req(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
   const t = getToken()

@@ -1,18 +1,20 @@
 <!doctype html>
 <!--
-  Docket Service — the multi-project control-plane dashboard.
+  Docket Hub — the multi-project control-plane dashboard.
 
   A single self-contained page (no build step) served at / by control_app.py.
   Talks to /api/service/* with a separate admin login (service_token cookie).
-  Lists every registered project, launches/stops each, links out to each
-  project's own board (/docket) and Run Full Build (/build) on its port, and
-  creates new greenfield projects.
+  From here the admin can see every registered project (status + ticket lane
+  counts), SWITCH INTO a project's board via a one-click SSO handoff, create
+  greenfield projects, install Docket into an existing folder (docket init as
+  a background job with a live log), edit a greenfield brief + groom it, and
+  launch/stop/remove projects.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Docket — Service</title>
+<title>Docket — Hub</title>
 <style>
   :root{--bg:#0e1117;--panel:#161b24;--panel2:#1c2330;--line:#2a3345;
         --text:#e6ebf4;--dim:#8b96ab;--accent:#4f8cff;--ok:#3fb96a;--warn:#e0a83c;--bad:#e05252;--green:#2f6f4a;}
@@ -28,36 +30,64 @@
          border-radius:8px;padding:7px 12px;cursor:pointer;font-size:13px}
   button:hover{border-color:var(--accent)}
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.danger:hover{border-color:var(--bad);color:var(--bad)}
   button.sm{padding:5px 10px;font-size:12px}
-  .wrap{max-width:1000px;margin:0 auto;padding:22px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
-  .card h3{margin:0 0 2px;font-size:15px}
-  .meta{color:var(--dim);font-size:12px;margin-bottom:12px}
+  button:disabled{opacity:.5;cursor:default}
+  .wrap{max-width:1100px;margin:0 auto;padding:22px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:8px}
+  .card h3{margin:0;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card h3 .x{margin-left:auto;color:var(--dim);cursor:pointer;font-size:13px;padding:2px 6px;border-radius:6px}
+  .card h3 .x:hover{color:var(--bad);background:rgba(224,82,82,.1)}
+  .meta{color:var(--dim);font-size:12px}
   .badge{display:inline-block;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;
          padding:2px 7px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--dim)}
   .dot.running{background:var(--ok)} .dot.stopped{background:var(--bad)} .dot.unknown{background:var(--warn)}
-  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
-  .actions a.btn{display:inline-block}
+  .lanes{display:flex;gap:6px;flex-wrap:wrap;min-height:20px}
+  .lane{font-size:11px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
+        border-radius:6px;padding:1px 7px}
+  .lane b{color:var(--text);font-weight:600}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:2px}
   .empty{color:var(--dim);padding:30px 0}
   .msg{padding:10px 14px;border-radius:8px;margin-bottom:14px;display:none}
   .msg.ok{background:rgba(63,185,106,.12);border:1px solid var(--ok);color:var(--ok);display:block}
   .msg.err{background:rgba(224,82,82,.12);border:1px solid var(--bad);color:var(--bad);display:block}
-  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
-  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:340px}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:20}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;width:400px;max-width:92vw}
+  .modal.wide{width:640px}
   .modal h2{margin:0 0 14px;font-size:16px}
   .modal label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
-  .modal input,.modal select{width:100%;background:var(--panel2);border:1px solid var(--line);
-               border-radius:7px;padding:8px;color:var(--text)}
+  .modal input,.modal select,.modal textarea{width:100%;background:var(--panel2);border:1px solid var(--line);
+               border-radius:7px;padding:8px;color:var(--text);font-family:inherit}
+  .modal textarea{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;min-height:380px;resize:vertical}
   .modal .row{display:flex;gap:8px;margin-top:16px}
   .modal .row button{flex:1}
   .err{color:var(--bad);font-size:12px;min-height:16px;margin-top:6px}
+  .hint{font-size:12px;min-height:16px;margin-top:6px;color:var(--dim)}
+  .hint.ok{color:var(--ok)} .hint.bad{color:var(--bad)}
+  .tabs{display:flex;gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:6px}
+  .tabs button{flex:1;border:none;border-radius:0;background:var(--panel2);color:var(--dim)}
+  .tabs button.on{background:var(--accent);color:#fff;font-weight:600}
+  .check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dim);margin-top:10px}
+  .check input{width:auto}
+  /* jobs drawer */
+  #jobs{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--line);
+        max-height:45vh;display:none;flex-direction:column;z-index:10}
+  #jobs.open{display:flex}
+  #jobs .bar{display:flex;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid var(--line);font-size:13px}
+  #jobs .bar .title{font-weight:600}
+  #jobs pre{margin:0;padding:10px 16px;overflow:auto;flex:1;
+            font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--dim);white-space:pre-wrap}
+  .jstatus{font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:2px 8px;border-radius:20px;border:1px solid var(--line)}
+  .jstatus.running{color:var(--warn);border-color:var(--warn)}
+  .jstatus.done{color:var(--ok);border-color:var(--ok)}
+  .jstatus.failed{color:var(--bad);border-color:var(--bad)}
 </style>
 </head>
 <body>
 <header>
-  <h1>Docket<span>·</span>Service</h1>
+  <h1>Docket<span>·</span>Hub</h1>
   <div class="spacer"></div>
   <button id="refresh" class="sm">Refresh</button>
   <button id="newBtn" class="primary sm">+ New Project</button>
@@ -71,7 +101,7 @@
 <!-- login -->
 <div class="overlay" id="loginOverlay" style="display:none">
   <form class="modal" id="loginForm">
-    <h2>Docket Service — sign in</h2>
+    <h2>Docket Hub — sign in</h2>
     <label>Username</label><input id="lu" autocomplete="username" value="admin">
     <label>Password</label><input id="lp" type="password" autocomplete="current-password">
     <div class="err" id="loginErr"></div>
@@ -79,26 +109,72 @@
   </form>
 </div>
 
-<!-- new project -->
+<!-- new project (two flavours) -->
 <div class="overlay" id="newOverlay" style="display:none">
   <form class="modal" id="newForm">
-    <h2>New greenfield project</h2>
-    <label>Name</label><input id="np" placeholder="My App" autofocus>
-    <label>Folder (optional)</label><input id="npath" placeholder="default: ./<slug>">
+    <h2>New project</h2>
+    <div class="tabs">
+      <button type="button" id="tabGreen" class="on">Greenfield</button>
+      <button type="button" id="tabExist">Existing folder</button>
+    </div>
+
+    <div id="paneGreen">
+      <label>Name</label><input id="np" placeholder="My App">
+      <label>Folder (optional)</label><input id="npath" placeholder="default: ./&lt;slug&gt;">
+      <div class="meta" style="margin-top:8px">Scaffolds folder + git + PROJECT_BRIEF.md.
+        Fill in the brief here on the hub, then Groom it into a backlog.</div>
+    </div>
+
+    <div id="paneExist" style="display:none">
+      <label>Folder on this machine</label>
+      <input id="ipath" placeholder="/home/me/my-repo" autocomplete="off">
+      <div class="hint" id="ipathHint"></div>
+      <label class="check" id="gitInitRow" style="display:none">
+        <input type="checkbox" id="gitInit"> Initialize git in this folder first
+      </label>
+      <div class="meta" style="margin-top:8px">Runs <code>docket init</code> — config + board +
+        codebase recognition (profile, CLAUDE.md, seed tickets). Recognition takes a few
+        minutes; you can watch the log while it runs.</div>
+    </div>
+
     <label>Dev mode</label>
     <select id="ndev">
-      <option value="direct_main" selected>direct_main — commit to main, no PR</option>
+      <option value="direct_main">direct_main — commit to main, no PR</option>
       <option value="pr">pr — branch + PR</option>
       <option value="auto_merge">auto_merge — branch + PR, auto-merged</option>
     </select>
+
     <div class="err" id="newErr"></div>
     <div class="row">
       <button type="button" id="newCancel">Cancel</button>
-      <button class="primary" type="submit">Create</button>
+      <button class="primary" type="submit" id="newSubmit">Create</button>
     </div>
-    <div class="meta" style="margin-top:10px">Creates the folder + brief. Then fill in
-      PROJECT_BRIEF.md and run <code>docket groom</code>.</div>
   </form>
+</div>
+
+<!-- greenfield brief editor -->
+<div class="overlay" id="briefOverlay" style="display:none">
+  <div class="modal wide">
+    <h2 id="briefTitle">PROJECT_BRIEF.md</h2>
+    <textarea id="briefText" spellcheck="false"></textarea>
+    <div class="err" id="briefErr"></div>
+    <div class="row">
+      <button type="button" id="briefCancel">Close</button>
+      <button type="button" id="briefSave">Save</button>
+      <button class="primary" type="button" id="briefGroom">Save &amp; Groom ▶</button>
+    </div>
+  </div>
+</div>
+
+<!-- background job drawer -->
+<div id="jobs">
+  <div class="bar">
+    <span class="title" id="jobTitle">Job</span>
+    <span class="jstatus running" id="jobStatus">running</span>
+    <div class="spacer" style="flex:1"></div>
+    <button class="sm" id="jobHide">Hide</button>
+  </div>
+  <pre id="jobLog"></pre>
 </div>
 
 <script>
@@ -131,61 +207,240 @@ document.getElementById("loginForm").addEventListener("submit", async e => {
 
 function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function msg(txt, ok){ const m=document.getElementById("msg"); m.className="msg "+(ok?"ok":"err"); m.innerHTML=txt; }
+function ago(iso){
+  if (!iso) return "";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (!isFinite(s) || s < 0) return "";
+  if (s < 90) return "just now";
+  if (s < 5400) return Math.round(s/60) + "m ago";
+  if (s < 129600) return Math.round(s/3600) + "h ago";
+  return Math.round(s/86400) + "d ago";
+}
+
+/* ---------------- projects grid ---------------- */
+let PROJECTS = [];
+
+function laneChips(sum){
+  if (!sum || !sum.total) return '<span class="lane">no tickets yet</span>';
+  const c = sum.counts || {};
+  const build = (c.queued||0) + (c.in_progress||0) + (c.self_review||0);
+  const review = (c.user_review||0) + (c.needs_info||0);
+  const parts = [];
+  if (c.discussion) parts.push(`<span class="lane"><b>${c.discussion}</b> discussion</span>`);
+  if (build)        parts.push(`<span class="lane"><b>${build}</b> building</span>`);
+  if (c.pr)         parts.push(`<span class="lane"><b>${c.pr}</b> pr</span>`);
+  if (review)       parts.push(`<span class="lane"><b>${review}</b> review</span>`);
+  if (c.done)       parts.push(`<span class="lane"><b>${c.done}</b> done</span>`);
+  return parts.join("") || `<span class="lane"><b>${sum.total}</b> tickets</span>`;
+}
 
 async function load(){
   let d;
   try { d = await api("/api/service/projects"); } catch(e){ return; }
+  PROJECTS = d.projects || [];
   const grid = document.getElementById("grid");
-  const projects = d.projects || [];
-  if (!projects.length){
-    grid.innerHTML = '<div class="empty">No projects yet. Click <b>+ New Project</b>, or run <code>docket init</code> in a repo.</div>';
+  if (!PROJECTS.length){
+    grid.innerHTML = '<div class="empty">No projects yet. Click <b>+ New Project</b> to create one or install Docket into an existing folder.</div>';
     return;
   }
-  grid.innerHTML = projects.map(p => {
+  grid.innerHTML = PROJECTS.map(p => {
     const running = p.status === "running";
-    const openBtns = running
-      ? `<a class="btn" href="${esc(p.url)}/docket" target="_blank"><button class="sm">Board ↗</button></a>
-         <a class="btn" href="${esc(p.url)}/build" target="_blank"><button class="sm">Run Build ↗</button></a>`
-      : "";
+    const act = p.summary && p.summary.last_activity ? ` · ${ago(p.summary.last_activity)}` : "";
+    let open = "";
+    if (running) {
+      open = p.has_config
+        ? `<button class="primary sm" onclick="openProject('${esc(p.id)}','/docket/')">Open →</button>
+           <button class="sm" onclick="openProject('${esc(p.id)}','/roadmap')">Roadmap</button>
+           <button class="sm" onclick="openProject('${esc(p.id)}','/build')">Build</button>`
+        : `<a href="${esc(p.url)}/docket" target="_blank"><button class="primary sm">Open ↗</button></a>`;
+    }
     const toggle = running
       ? `<button class="sm" onclick="ctl('${esc(p.id)}','stop')">Stop</button>`
       : `<button class="primary sm" onclick="ctl('${esc(p.id)}','launch')">Launch</button>`;
+    const extras = p.brief_exists
+      ? `<button class="sm" onclick="openBrief('${esc(p.id)}')">Brief ✎</button>
+         <button class="sm" onclick="groomProject('${esc(p.id)}')">Groom ▶</button>`
+      : "";
     return `<div class="card">
-      <h3>${esc(p.name)}</h3>
+      <h3>${esc(p.name)}<span class="x" title="Remove from hub (files stay on disk)"
+            onclick="removeProject('${esc(p.id)}','${esc(p.name)}')">✕</span></h3>
       <div class="meta"><span class="dot ${esc(p.status)}"></span>${esc(p.status)}
         · <span class="badge">${esc(p.kind)}</span>
-        · :${esc(String(p.port))} · ${esc(p.dev_mode)}</div>
-      <div class="actions">${toggle}${openBtns}</div>
+        · :${esc(String(p.port))} · ${esc(p.dev_mode)}${act}</div>
+      <div class="lanes">${laneChips(p.summary)}</div>
+      <div class="actions">${open}${toggle}${extras}</div>
     </div>`;
   }).join("");
 }
 
 async function ctl(id, action){
-  try { const d = await api(`/api/service/projects/${id}/${action}`, {method:"POST", body:"{}"});
-    msg(`${action === "launch" ? "Launched" : "Stopped"} ${id}.`, true); load();
-  } catch(e){ msg(`Failed to ${action} ${id}: ${esc(e.message)}`, false); }
+  try { await api(`/api/service/projects/${id}/${action}`, {method:"POST", body:"{}"});
+    msg(`${action === "launch" ? "Launched" : "Stopped"} ${esc(id)}.`, true); load();
+  } catch(e){ msg(`Failed to ${action} ${esc(id)}: ${esc(e.message)}`, false); }
 }
 
-document.getElementById("newBtn").addEventListener("click", () => {
-  document.getElementById("newOverlay").style.display = "flex";
+/* Switch into a project: mint a tester token, open its board with ?sso=. */
+async function openProject(id, page){
+  try {
+    const d = await api(`/api/service/projects/${id}/sso`, {method:"POST", body:"{}"});
+    const url = `http://${location.hostname}:${d.port}${page}?sso=${encodeURIComponent(d.token)}&name=${encodeURIComponent(d.name)}`;
+    window.open(url, "_blank");
+  } catch(e){
+    const p = PROJECTS.find(x => x.id === id);
+    if (p) window.open(`${p.url}/docket`, "_blank");   // legacy: plain link, sign in there
+    else msg(esc(e.message), false);
+  }
+}
+
+async function removeProject(id, name){
+  if (!confirm(`Remove “${name}” from the hub?\n\nIts services are stopped and it disappears from this dashboard. Nothing on disk is deleted — re-add it any time via “Existing folder”.`)) return;
+  try { await api(`/api/service/projects/${id}`, {method:"DELETE"});
+    msg(`Removed ${esc(name)} from the hub.`, true); load();
+  } catch(e){ msg(`Failed to remove: ${esc(e.message)}`, false); }
+}
+
+/* ---------------- new project modal ---------------- */
+let NEWTAB = "green";
+const nOverlay = document.getElementById("newOverlay");
+function setTab(t){
+  NEWTAB = t;
+  document.getElementById("tabGreen").className = t === "green" ? "on" : "";
+  document.getElementById("tabExist").className = t === "exist" ? "on" : "";
+  document.getElementById("paneGreen").style.display = t === "green" ? "" : "none";
+  document.getElementById("paneExist").style.display = t === "exist" ? "" : "none";
+  document.getElementById("ndev").value = t === "green" ? "direct_main" : "pr";
+  document.getElementById("newSubmit").textContent = t === "green" ? "Create" : "Install Docket";
+  document.getElementById("newErr").textContent = "";
+}
+document.getElementById("tabGreen").addEventListener("click", () => setTab("green"));
+document.getElementById("tabExist").addEventListener("click", () => setTab("exist"));
+document.getElementById("newBtn").addEventListener("click", () => { nOverlay.style.display = "flex"; });
+document.getElementById("newCancel").addEventListener("click", () => { nOverlay.style.display = "none"; });
+
+let VALIDATED = null, vTimer = null;
+document.getElementById("ipath").addEventListener("input", () => {
+  clearTimeout(vTimer);
+  vTimer = setTimeout(validatePath, 450);
 });
-document.getElementById("newCancel").addEventListener("click", () => {
-  document.getElementById("newOverlay").style.display = "none";
-});
+async function validatePath(){
+  const path = document.getElementById("ipath").value.trim();
+  const hint = document.getElementById("ipathHint");
+  const gitRow = document.getElementById("gitInitRow");
+  VALIDATED = null; gitRow.style.display = "none";
+  if (!path){ hint.textContent = ""; hint.className = "hint"; return; }
+  try {
+    const v = await api("/api/service/validate-path", {method:"POST", body:JSON.stringify({path})});
+    VALIDATED = v;
+    if (!v.exists){ hint.textContent = "✗ folder not found on this machine"; hint.className = "hint bad"; }
+    else if (v.has_docket){ hint.textContent = "✗ Docket is already installed there" + (v.registered ? " (and it's on this hub)" : " — it will just be re-registered"); hint.className = "hint bad"; }
+    else if (!v.is_git){ hint.textContent = "⚠ folder exists but isn't a git repository"; hint.className = "hint"; gitRow.style.display = "flex"; }
+    else { hint.textContent = "✓ git repository — ready to install"; hint.className = "hint ok"; }
+  } catch(e){ hint.textContent = esc(e.message); hint.className = "hint bad"; }
+}
+
 document.getElementById("newForm").addEventListener("submit", async e => {
   e.preventDefault();
-  const errEl = document.getElementById("newErr"); errEl.textContent = "Creating…";
+  const errEl = document.getElementById("newErr");
+  const dev = document.getElementById("ndev").value;
   try {
-    const d = await api("/api/service/projects", {method:"POST", body:JSON.stringify({
-      name: document.getElementById("np").value,
-      path: document.getElementById("npath").value,
-      dev_mode: document.getElementById("ndev").value })});
-    document.getElementById("newOverlay").style.display = "none";
-    document.getElementById("newForm").reset();
-    msg(`Created “${esc(d.project.name)}”. Fill in its PROJECT_BRIEF.md, then run <code>docket groom</code>.`, true);
-    load();
+    if (NEWTAB === "green") {
+      errEl.textContent = "Creating…";
+      const d = await api("/api/service/projects", {method:"POST", body:JSON.stringify({
+        name: document.getElementById("np").value,
+        path: document.getElementById("npath").value,
+        dev_mode: dev })});
+      nOverlay.style.display = "none";
+      document.getElementById("newForm").reset(); setTab("green");
+      msg(`Created “${esc(d.project.name)}”. Now open <b>Brief ✎</b> on its card, fill it in, and hit <b>Save &amp; Groom</b>.`, true);
+      load();
+    } else {
+      errEl.textContent = "Starting install…";
+      const d = await api("/api/service/projects/init", {method:"POST", body:JSON.stringify({
+        path: document.getElementById("ipath").value.trim(),
+        dev_mode: dev,
+        git_init: document.getElementById("gitInit").checked })});
+      nOverlay.style.display = "none";
+      document.getElementById("newForm").reset(); setTab("green");
+      watchJob(d.job, "Installing Docket");
+    }
   } catch(err){ errEl.textContent = err.message; }
 });
+
+/* ---------------- brief editor ---------------- */
+let BRIEF_ID = null;
+async function openBrief(id){
+  try {
+    const d = await api(`/api/service/projects/${id}/brief`);
+    BRIEF_ID = id;
+    document.getElementById("briefTitle").textContent = `PROJECT_BRIEF.md — ${id}`;
+    document.getElementById("briefText").value = d.content;
+    document.getElementById("briefErr").textContent = "";
+    document.getElementById("briefOverlay").style.display = "flex";
+  } catch(e){ msg(esc(e.message), false); }
+}
+async function saveBrief(){
+  await api(`/api/service/projects/${BRIEF_ID}/brief`, {method:"PUT",
+    body: JSON.stringify({content: document.getElementById("briefText").value})});
+}
+document.getElementById("briefCancel").addEventListener("click", () => {
+  document.getElementById("briefOverlay").style.display = "none";
+});
+document.getElementById("briefSave").addEventListener("click", async () => {
+  const errEl = document.getElementById("briefErr");
+  try { await saveBrief(); errEl.textContent = ""; msg("Brief saved.", true); }
+  catch(e){ errEl.textContent = e.message; }
+});
+document.getElementById("briefGroom").addEventListener("click", async () => {
+  const errEl = document.getElementById("briefErr");
+  try {
+    await saveBrief();
+    const id = BRIEF_ID;
+    document.getElementById("briefOverlay").style.display = "none";
+    await groomProject(id);
+  } catch(e){ errEl.textContent = e.message; }
+});
+async function groomProject(id){
+  try {
+    const d = await api(`/api/service/projects/${id}/groom`, {method:"POST", body:"{}"});
+    watchJob(d.job, `Grooming ${id}`);
+  } catch(e){ msg(esc(e.message), false); }
+}
+
+/* ---------------- job drawer ---------------- */
+let JOB_ID = null, jobTimer = null;
+function watchJob(job, title){
+  JOB_ID = job.id;
+  document.getElementById("jobTitle").textContent = title || job.kind;
+  document.getElementById("jobs").classList.add("open");
+  renderJob(job);
+  clearInterval(jobTimer);
+  jobTimer = setInterval(pollJob, 1500);
+}
+function renderJob(job){
+  const st = document.getElementById("jobStatus");
+  st.textContent = job.status; st.className = "jstatus " + job.status;
+  const log = document.getElementById("jobLog");
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  log.textContent = (job.lines || []).join("\n") || "…";
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+async function pollJob(){
+  if (!JOB_ID) return;
+  let job;
+  try { job = await api(`/api/service/jobs/${JOB_ID}`); } catch(e){ return; }
+  renderJob(job);
+  if (job.status !== "running"){
+    clearInterval(jobTimer); jobTimer = null;
+    msg(job.status === "done"
+        ? `${esc(job.kind)} finished.` : `${esc(job.kind)} failed — see the log below.`,
+        job.status === "done");
+    load();
+  }
+}
+document.getElementById("jobHide").addEventListener("click", () => {
+  document.getElementById("jobs").classList.remove("open");
+});
+
 document.getElementById("refresh").addEventListener("click", load);
 load();
 </script>
