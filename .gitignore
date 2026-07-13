@@ -7,7 +7,7 @@ __pycache__/
 
 # Local dev state — the session workfile holds credentials; node_modules is a symlink.
 /WORKING.md
-frontend/node_modules/
+frontend/node_modules
 
 # DO ship the prebuilt React bundle — it's a build input for the wheel and lets
 # `pipx install` work without a frontend toolchain. This overrides the repo-root
