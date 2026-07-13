@@ -35,10 +35,13 @@ def get_board(tester: dict = Depends(require_tester)):
 
 
 @router.get("/analytics")
-def get_analytics(tester: dict = Depends(require_tester)):
+def get_analytics(epic_id: Optional[int] = None,
+                  tester: dict = Depends(require_tester)):
     """Schedule/effort analytics: burndown+ideal+projection, scope-creep, spent-vs-
-    left, per-week loading, and a schedule-health score."""
-    return rm.analytics()
+    left, per-week loading, and a schedule-health score. `?epic_id=N` scopes every
+    number to that epic (historical burndown series is omitted — no epic dimension
+    in the snapshots)."""
+    return rm.analytics(epic_id=epic_id)
 
 
 class CycleIn(BaseModel):

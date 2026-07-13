@@ -65,6 +65,11 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
   const [busy, setBusy] = useState(false)
   const [amending, setAmending] = useState(false)
   const [testers, setTesters] = useState([])
+  const [epics, setEpics] = useState([])
+
+  useEffect(() => {
+    api.epics().then((r) => setEpics(r.epics || [])).catch(() => {})
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -282,6 +287,15 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
                 <Field label="Type">
                   <InlineSelect value={t.type} onSave={(v) => patch({ type: v })}
                     options={(meta.types || ['feature', 'bug']).map((x) => ({ value: x, label: x }))} />
+                </Field>
+                <Field label="Epic">
+                  <div className="flex items-center gap-1.5">
+                    {t.epic_color && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: t.epic_color }} />}
+                    <InlineSelect value={t.epic_id ? String(t.epic_id) : ''}
+                      onSave={(v) => patch({ epic_id: v ? Number(v) : 0 })}
+                      options={[{ value: '', label: '— no epic' },
+                        ...epics.map((e) => ({ value: String(e.id), label: e.name }))]} />
+                  </div>
                 </Field>
                 <Field label="Estimate"><InlineNumber value={t.estimate_hours} suffix="h" onSave={(v) => roadmap({ estimate_hours: v })} /></Field>
                 <Field label="Remaining"><InlineNumber value={t.remaining_hours} suffix="h" onSave={(v) => roadmap({ remaining_hours: v })} /></Field>

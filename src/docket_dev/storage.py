@@ -32,6 +32,7 @@ import json
 import re
 import sqlite3
 import statistics
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -296,6 +297,17 @@ CREATE TABLE IF NOT EXISTS roadmap_snapshots (
     bumps           INTEGER NOT NULL DEFAULT 0,-- bump events recorded on this date
     PRIMARY KEY (cycle_id, date)
 );
+
+-- Epics: named, color-coded groupings of tickets (e.g. "Cellebrite",
+-- "Financial"). A ticket belongs to at most one epic (tickets.epic_id).
+CREATE TABLE IF NOT EXISTS epics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    color       TEXT NOT NULL DEFAULT '#6366f1',
+    description TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
 """
 
 
@@ -322,7 +334,8 @@ def init_db() -> None:
                          # by the agent when dev_optin=1 — set solely by explicit handoff).
                          ("roadmap_status", "TEXT NOT NULL DEFAULT 'todo'"),  # backlog|todo|in_progress|done
                          ("hours_done", "REAL"),                             # actual effort logged
-                         ("dev_optin", "INTEGER NOT NULL DEFAULT 0")):       # 1 = eligible for automation
+                         ("dev_optin", "INTEGER NOT NULL DEFAULT 0"),        # 1 = eligible for automation
+                         ("epic_id", "INTEGER")):                            # epics.id; NULL = no epic
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -354,6 +367,9 @@ def _row_to_ticket(row: sqlite3.Row) -> Dict[str, Any]:
             d[col] = json.loads(d.get(col) or "[]")
         except (ValueError, TypeError):
             d[col] = []
+    epic = epics_map().get(d.get("epic_id")) if d.get("epic_id") else None
+    d["epic_name"] = epic["name"] if epic else ""
+    d["epic_color"] = epic["color"] if epic else ""
     return d
 
 
@@ -365,6 +381,110 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
         except (ValueError, TypeError):
             pass
     return d
+
+
+# ---------------------------------------------------------------------------
+# Epics — named, color-coded ticket groupings
+# ---------------------------------------------------------------------------
+
+# Distinct hues; a new epic without an explicit color takes the next unused.
+EPIC_PALETTE = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444",
+                "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#84cc16"]
+
+# Per-process cache so every serialized ticket doesn't re-query epics.
+# Invalidated on CRUD in this process; a short TTL covers other processes.
+_EPIC_CACHE: Dict[str, Any] = {"at": 0.0, "map": {}}
+_EPIC_TTL = 15.0
+
+
+def epics_map() -> Dict[int, Dict[str, Any]]:
+    now = time.monotonic()
+    if now - _EPIC_CACHE["at"] > _EPIC_TTL:
+        conn = _connect()
+        try:
+            _EPIC_CACHE["map"] = {r["id"]: dict(r) for r in
+                                  conn.execute("SELECT * FROM epics").fetchall()}
+            _EPIC_CACHE["at"] = now
+        finally:
+            conn.close()
+    return _EPIC_CACHE["map"]
+
+
+def _invalidate_epics() -> None:
+    _EPIC_CACHE["at"] = 0.0
+
+
+def list_epics() -> List[Dict[str, Any]]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT e.*, COUNT(t.id) AS ticket_count,
+                      SUM(CASE WHEN t.status='done' THEN 1 ELSE 0 END) AS done_count
+               FROM epics e LEFT JOIN tickets t ON t.epic_id = e.id
+               GROUP BY e.id ORDER BY e.name COLLATE NOCASE""").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def create_epic(name: str, color: str = "", description: str = "",
+                created_by: str = "") -> Dict[str, Any]:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("epic name is required")
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM epics WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+        if existing:
+            raise ValueError(f"an epic named '{name}' already exists")
+        if not color:
+            used = {r["color"] for r in conn.execute("SELECT color FROM epics")}
+            color = next((c for c in EPIC_PALETTE if c not in used),
+                         EPIC_PALETTE[conn.execute("SELECT COUNT(*) FROM epics")
+                                      .fetchone()[0] % len(EPIC_PALETTE)])
+        cur = conn.execute(
+            "INSERT INTO epics (name, color, description, created_by, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (name[:120], color[:20], str(description)[:2000], created_by, utcnow_iso()))
+        conn.commit()
+        row = conn.execute("SELECT * FROM epics WHERE id=?", (cur.lastrowid,)).fetchone()
+    finally:
+        conn.close()
+    _invalidate_epics()
+    return dict(row)
+
+
+def update_epic(epic_id: int, **fields) -> Optional[Dict[str, Any]]:
+    sets, vals = [], []
+    for k in ("name", "color", "description"):
+        if k in fields and fields[k] is not None:
+            sets.append(f"{k}=?")
+            vals.append(str(fields[k]).strip())
+    conn = _connect()
+    try:
+        if sets:
+            vals.append(epic_id)
+            conn.execute(f"UPDATE epics SET {', '.join(sets)} WHERE id=?", vals)
+            conn.commit()
+        row = conn.execute("SELECT * FROM epics WHERE id=?", (epic_id,)).fetchone()
+    finally:
+        conn.close()
+    _invalidate_epics()
+    return dict(row) if row else None
+
+
+def delete_epic(epic_id: int) -> bool:
+    """Delete an epic; its tickets are unlinked, never touched otherwise."""
+    conn = _connect()
+    try:
+        conn.execute("UPDATE tickets SET epic_id=NULL WHERE epic_id=?", (epic_id,))
+        n = conn.execute("DELETE FROM epics WHERE id=?", (epic_id,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    _invalidate_epics()
+    return n > 0
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +501,7 @@ def create_ticket(
     seed_user_item_id: str = "",
     build_seq: Optional[int] = None,
     dev_optin: bool = False,
+    epic_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Raise a new ticket in the Discussion zone. Returns the created ticket.
     `build_seq` records 1-based build order (set by greenfield grooming; drives
@@ -402,12 +523,12 @@ def create_ticket(
             """INSERT INTO tickets
                (title, type, description, acceptance_criteria, clarity_score,
                 clarity_level, priority, status, created_by, seed_user_item_id,
-                build_seq, dev_optin, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?)""",
+                build_seq, dev_optin, epic_id, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?,?)""",
             (title[:300], type, str(description)[:20000],
              str(acceptance_criteria)[:10000], clarity["score"], clarity["level"],
              priority, created_by, seed_user_item_id, build_seq,
-             1 if dev_optin else 0, now, now),
+             1 if dev_optin else 0, epic_id or None, now, now),
         )
         tid = cur.lastrowid
         conn.execute(
@@ -474,7 +595,7 @@ def unestimated_tickets() -> List[Dict[str, Any]]:
 _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
-    "assignee", "touched_paths", "touched_routes", "dev_optin",
+    "assignee", "touched_paths", "touched_routes", "dev_optin", "epic_id",
 }
 
 
@@ -488,6 +609,12 @@ def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
             continue
         if k == "type" and v not in TICKET_TYPES:
             continue
+        if k == "epic_id":
+            v = int(v) if v else None       # 0 / "" / None all unlink the epic
+            if v is not None and v not in epics_map():
+                _invalidate_epics()          # maybe created moments ago elsewhere
+                if v not in epics_map():
+                    raise ValueError(f"unknown epic {v}")
         sets.append(f"{k}=?")
         vals.append(v)
     if not sets:
@@ -951,9 +1078,12 @@ def analytics() -> Dict[str, Any]:
             c, d = _epoch(t.get("created_at")), _epoch(dts)
             if c and d and d >= c:
                 cs = round(d - c)
+        ep = epics_map().get(t.get("epic_id")) if t.get("epic_id") else None
         ticket_rows.append({
             "id": tid, "ref": ticket_ref(tid), "title": t.get("title", ""),
             "type": t.get("type"), "status": t.get("status"), "priority": t.get("priority"),
+            "epic_id": t.get("epic_id"), "epic_name": ep["name"] if ep else "",
+            "epic_color": ep["color"] if ep else "",
             "assignee": t.get("assignee") or "", "created_by": t.get("created_by") or "",
             "created_at": t.get("created_at"), "updated_at": t.get("updated_at"),
             "done_ts": dts, "cycle_secs": cs,

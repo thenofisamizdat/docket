@@ -441,11 +441,25 @@ def board() -> Dict[str, Any]:
     }
 
 
-def analytics() -> Dict[str, Any]:
+def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
     """Schedule/effort analytics for the roadmap dashboard: burndown series (with an
     ideal + a velocity projection), scope-creep, spent-vs-left, per-week loading, and
-    a composite schedule-health score. Reuses board() + the snapshot series."""
+    a composite schedule-health score. Reuses board() + the snapshot series.
+
+    With `epic_id`, every number is computed over that epic's tickets only. The
+    daily snapshots are cycle-global (no epic dimension), so the historical
+    burndown series is dropped — the chart shows ideal + live projection from
+    current state instead, and scope-creep reports zero injected."""
     b = board()
+    if epic_id:
+        b["lanes"] = {k: [t for t in v if t.get("epic_id") == epic_id]
+                      for k, v in b["lanes"].items()}
+        live = [t for lane in b["lanes"].values() for t in lane
+                if t.get("week_lane") and t["status"] != _VOID]
+        b["total_scope"] = sum(float(t.get("estimate_hours") or 0) for t in live)
+        b["hours_to_completion"] = sum(float(t.get("effective_remaining") or 0)
+                                       for t in live if not _is_done(t))
+        b["snapshots"] = []
     cycle = b["cycle"]
     weeks = b["weeks"]
     snaps = b["snapshots"]

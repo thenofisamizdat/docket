@@ -16,7 +16,14 @@ export default function NewTicketModal({ meta, onClose, onCreated, prefill }) {
   const [clarity, setClarity] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  const [epics, setEpics] = useState([])
+  const [epicId, setEpicId] = useState(prefill?.epic_id || '')
   const descRef = useRef(null)
+
+  useEffect(() => {
+    api.epics().then((r) => setEpics(r.epics || [])).catch(() => {})
+  }, [])
+  const epic = epics.find((e) => String(e.id) === String(epicId))
 
   // Live clarity meter — debounced score of the in-progress ask.
   useEffect(() => {
@@ -36,6 +43,7 @@ export default function NewTicketModal({ meta, onClose, onCreated, prefill }) {
       const r = await api.create({
         title, type, priority,
         description, acceptance_criteria: acceptance,
+        epic_id: epicId ? Number(epicId) : null,
       })
       onCreated(r.ticket)
     } catch (e) {
@@ -86,6 +94,16 @@ export default function NewTicketModal({ meta, onClose, onCreated, prefill }) {
               {meta.priorities.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </div>
+        </div>
+
+        <label className="block text-xs font-medium text-slate-600 mb-1">Epic</label>
+        <div className="flex items-center gap-2 mb-3">
+          {epic && <span className="w-3 h-3 rounded-full shrink-0" style={{ background: epic.color }} />}
+          <select className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+            value={epicId} onChange={(e) => setEpicId(e.target.value)}>
+            <option value="">— no epic</option>
+            {epics.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
+          </select>
         </div>
 
         <label className="block text-xs font-medium text-slate-600 mb-1">Description</label>

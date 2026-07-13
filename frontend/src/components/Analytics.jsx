@@ -9,7 +9,7 @@ import { fmtDuration } from '../ui.js'
 
 const isDone = (r) => r.status === 'done' || r.roadmap_status === 'done'
 
-const EMPTY_FILTER = { type: 'all', status: 'all', assignee: 'all', source: 'all', days: 'all' }
+const EMPTY_FILTER = { type: 'all', status: 'all', assignee: 'all', source: 'all', days: 'all', epic: 'all' }
 
 function applyFilters(rows, f) {
   return rows.filter((r) => {
@@ -19,6 +19,7 @@ function applyFilters(rows, f) {
     if (f.status === 'open' && isDone(r)) return false
     if (f.status === 'done' && !isDone(r)) return false
     if (f.assignee !== 'all' && (r.assignee || r.created_by || '') !== f.assignee) return false
+    if (f.epic === 'none' ? r.epic_name : (f.epic !== 'all' && r.epic_name !== f.epic)) return false
     if (f.days !== 'all' && (!r.created_at || Date.parse(r.created_at) < Date.now() - f.days * 86400000)) return false
     return true
   })
@@ -62,6 +63,11 @@ export default function Analytics() {
     rows.forEach((r) => { if (r.assignee) s.add(r.assignee); else if (r.created_by) s.add(r.created_by) })
     return [...s].sort()
   }, [rows])
+  const epicNames = useMemo(() => {
+    const s = new Set()
+    rows.forEach((r) => { if (r.epic_name) s.add(r.epic_name) })
+    return [...s].sort()
+  }, [rows])
   const filtered = useMemo(() => applyFilters(rows, filter), [rows, filter])
 
   if (err) return <div className="p-6 text-red-600 text-sm">{err}</div>
@@ -76,7 +82,7 @@ export default function Analytics() {
     <div className="max-w-5xl mx-auto p-4 space-y-4">
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 sticky top-0 z-10">
-        <FilterControls f={filter} set={setFilter} assignees={assignees} />
+        <FilterControls f={filter} set={setFilter} assignees={assignees} epics={epicNames} />
         <span className="text-[11px] text-slate-400">{filtered.length} of {rows.length} tickets</span>
         <div className="flex-1" />
         {filter !== EMPTY_FILTER && (
@@ -89,8 +95,8 @@ export default function Analytics() {
 
       {compare ? (
         <div className="grid md:grid-cols-2 gap-3">
-          <CompareColumn label="A" f={filter} set={setFilter} assignees={assignees} rows={applyFilters(rows, filter)} />
-          <CompareColumn label="B" f={filterB} set={setFilterB} assignees={assignees} rows={applyFilters(rows, filterB)} />
+          <CompareColumn label="A" f={filter} set={setFilter} assignees={assignees} epics={epicNames} rows={applyFilters(rows, filter)} />
+          <CompareColumn label="B" f={filterB} set={setFilterB} assignees={assignees} epics={epicNames} rows={applyFilters(rows, filterB)} />
         </div>
       ) : (
         <>
@@ -204,12 +210,12 @@ function StatRow({ rows }) {
   )
 }
 
-function CompareColumn({ label, f, set, assignees, rows }) {
+function CompareColumn({ label, f, set, assignees, epics, rows }) {
   return (
     <div className="border border-slate-200 rounded-xl p-3 space-y-3 bg-white">
       <div className="flex items-center gap-2">
         <span className="text-xs font-bold text-slate-400">{label}</span>
-        <div className="flex flex-wrap gap-1.5"><FilterControls f={f} set={set} assignees={assignees} compact /></div>
+        <div className="flex flex-wrap gap-1.5"><FilterControls f={f} set={set} assignees={assignees} epics={epics} compact /></div>
       </div>
       <StatRow rows={rows} />
       <HBars items={splitBy(rows, 'type').map(([k, v]) => ({ label: k, value: v.length, hint: `${v.length}` }))} color="#6366f1" empty="No tickets." />
@@ -228,13 +234,18 @@ function CmpRow({ label, a, b }) {
 }
 
 const SEL = 'text-xs bg-white border border-slate-200 rounded-lg px-2 py-1 text-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-200'
-function FilterControls({ f, set, assignees, compact }) {
+function FilterControls({ f, set, assignees, epics = [], compact }) {
   const on = (k) => (e) => set({ ...f, [k]: e.target.value === 'all' ? 'all' : (k === 'days' ? Number(e.target.value) : e.target.value) })
   return (
     <>
       <select className={SEL} value={f.type} onChange={on('type')}><option value="all">All types</option><option value="feature">Feature</option><option value="bug">Bug</option></select>
       <select className={SEL} value={f.source} onChange={on('source')}><option value="all">All sources</option><option value="automated">Automated</option><option value="manual">Manual</option></select>
       <select className={SEL} value={f.status} onChange={on('status')}><option value="all">Any status</option><option value="open">Open</option><option value="done">Done</option></select>
+      <select className={SEL} value={f.epic} onChange={on('epic')}>
+        <option value="all">All epics</option>
+        <option value="none">No epic</option>
+        {epics.map((x) => <option key={x} value={x}>{x}</option>)}
+      </select>
       {!compact && (
         <select className={SEL} value={f.assignee} onChange={on('assignee')}>
           <option value="all">Anyone</option>

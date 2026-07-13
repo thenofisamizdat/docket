@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from docket_dev import storage, telemetry
 from docket_dev.auth import build_login_router
 from docket_dev.roadmap_routes import router as roadmap_router
-from docket_dev.routes import router as docket_router
+from docket_dev.routes import epics_router, router as docket_router
 
 
 def _dist_dir() -> str:
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Docket", docs_url=None, redoc_url=None)
     storage.init_db()
     app.include_router(docket_router)          # /api/tickets/*
+    app.include_router(epics_router)           # /api/epics/*
     app.include_router(roadmap_router)         # /api/roadmap/*
     app.include_router(build_login_router())   # /api/testing/login, /api/testing/me
     telemetry.install(app)                     # per-route traffic/error capture (graceful)

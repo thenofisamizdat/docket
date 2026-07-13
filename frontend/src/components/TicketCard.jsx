@@ -11,10 +11,18 @@ export default function TicketCard({ ticket, onOpen }) {
     <button
       onClick={() => onOpen(ticket.id)}
       className="w-full text-left bg-white rounded-lg border border-slate-200 hover:border-indigo-400 hover:shadow-sm transition p-3 mb-2"
+      style={ticket.epic_color ? { borderLeft: `3px solid ${ticket.epic_color}` } : undefined}
     >
-      <div className="flex items-center justify-between mb-1">
+      <div className="flex items-center justify-between mb-1 gap-1">
         <span className="font-mono text-[11px] text-slate-400">{ticket.ref}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${PRIORITY_BADGE[ticket.priority] || 'bg-slate-300'}`}>
+        {ticket.epic_name && (
+          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full truncate"
+            style={{ background: `${ticket.epic_color}1f`, color: ticket.epic_color }}
+            title={`Epic: ${ticket.epic_name}`}>
+            {ticket.epic_name}
+          </span>
+        )}
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${PRIORITY_BADGE[ticket.priority] || 'bg-slate-300'}`}>
           {ticket.priority}
         </span>
       </div>

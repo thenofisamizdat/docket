@@ -139,6 +139,7 @@ class TicketIn(BaseModel):
     acceptance_criteria: str = ""
     priority: str = dk.DEFAULT_PRIORITY
     seed_user_item_id: str = ""
+    epic_id: Optional[int] = None
 
 
 @router.post("")
@@ -153,6 +154,7 @@ def create_ticket(body: TicketIn, tester: dict = Depends(require_tester)):
             priority=body.priority,
             created_by=tester.get("name", ""),
             seed_user_item_id=body.seed_user_item_id,
+            epic_id=body.epic_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -176,7 +178,7 @@ def bulk_create(body: BulkIn, tester: dict = Depends(require_tester)):
             t = dk.create_ticket(
                 title=row.title, type=row.type, description=row.description,
                 acceptance_criteria=row.acceptance_criteria, priority=row.priority,
-                created_by=tester.get("name", ""))
+                created_by=tester.get("name", ""), epic_id=row.epic_id)
             created.append({"ref": t["ref"], "id": t["id"], "title": t["title"]})
         except ValueError as e:
             errors.append({"row": i + 1, "title": row.title, "error": str(e)})
@@ -212,6 +214,7 @@ class TicketPatch(BaseModel):
     priority: Optional[str] = None
     test_instructions: Optional[str] = None
     assignee: Optional[str] = None
+    epic_id: Optional[int] = None   # 0 unlinks; omitted = unchanged
 
 
 @router.patch("/{ticket_id}")
@@ -414,3 +417,54 @@ def add_comment(ticket_id: int, body: CommentIn, tester: dict = Depends(require_
     ev = dk.add_event(ticket_id, "comment", summary=body.text.strip(),
                       actor=tester.get("name", ""))
     return {"event": ev}
+
+
+# ---------------------------------------------------------------------------
+# Epics — named, color-coded ticket groupings (own prefix: /api/epics)
+# ---------------------------------------------------------------------------
+
+epics_router = APIRouter(prefix="/api/epics", tags=["epics"])
+
+
+class EpicIn(BaseModel):
+    name: str
+    color: str = ""          # hex; empty = auto-assign from the palette
+    description: str = ""
+
+
+class EpicPatch(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    description: Optional[str] = None
+
+
+@epics_router.get("")
+def list_epics(tester: dict = Depends(require_tester)):
+    return {"epics": dk.list_epics(), "palette": dk.EPIC_PALETTE}
+
+
+@epics_router.post("")
+def create_epic(body: EpicIn, tester: dict = Depends(require_tester)):
+    try:
+        e = dk.create_epic(name=body.name, color=body.color,
+                           description=body.description,
+                           created_by=tester.get("name", ""))
+    except ValueError as e_:
+        raise HTTPException(status_code=400, detail=str(e_))
+    return {"epic": e}
+
+
+@epics_router.patch("/{epic_id}")
+def patch_epic(epic_id: int, body: EpicPatch, tester: dict = Depends(require_tester)):
+    e = dk.update_epic(epic_id, **{k: v for k, v in body.dict().items() if v is not None})
+    if not e:
+        raise HTTPException(status_code=404, detail=f"epic {epic_id} not found")
+    return {"epic": e}
+
+
+@epics_router.delete("/{epic_id}")
+def delete_epic(epic_id: int, tester: dict = Depends(require_tester)):
+    """Delete an epic; its tickets are unlinked (never deleted)."""
+    if not dk.delete_epic(epic_id):
+        raise HTTPException(status_code=404, detail=f"epic {epic_id} not found")
+    return {"ok": True}
