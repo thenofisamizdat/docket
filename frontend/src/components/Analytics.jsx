@@ -21,6 +21,10 @@ export default function Analytics() {
 
   const clar = a.clarity.distribution
   const clarTotal = clar.low + clar.medium + clar.high
+  const pipe = a.pipeline
+  const vTotal = pipe ? pipe.verified + pipe.unverified : 0
+  const verifiedPct = vTotal ? Math.round((pipe.verified / vTotal) * 100) : 0
+  const pretty = (s) => (s || '').replace(/_/g, ' ')
 
   return (
     <div className="max-w-5xl mx-auto p-4 space-y-4">
@@ -31,6 +35,54 @@ export default function Analytics() {
         <Stat label="Avg effort / ticket" value={fmtDuration(a.effort.avg_secs) || '—'} sub={`$${a.effort.avg_cost_usd} avg`} />
         <Stat label="Total agent cost" value={`$${a.effort.total_cost_usd}`} sub={`${fmtDuration(a.effort.total_secs)} compute · ${a.quality.resubmits} resubmits`} />
       </div>
+
+      {/* Pipeline analytics */}
+      {pipe && (
+        <Card title="Pipeline" hint="Automated development — throughput, cost, cycle time, quality & flow">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <Stat label="Shipped" value={pipe.cycle_count} sub="done by the agent" />
+            <Stat label="Avg cycle time" value={fmtDuration(pipe.avg_cycle_secs) || '—'} sub="created → done" />
+            <Stat label="Verified" value={`${verifiedPct}%`} sub={`${pipe.verified} verified · ${pipe.unverified} not`} tone={vTotal && verifiedPct < 60 ? 'warn' : undefined} />
+            <Stat label="Rework rate" value={`${pipe.rework_rate}%`} sub={`${a.quality.failed_review} needed a redo`} tone={pipe.rework_rate > 25 ? 'warn' : undefined} />
+          </div>
+          <div className="grid md:grid-cols-2 gap-4">
+            <div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Throughput / day</div>
+              <MiniBars data={pipe.throughput_by_day} color="#3fb96a" fmt={(v) => `${v} shipped`} />
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Agent cost / day</div>
+              <Spark data={pipe.cost_by_day} color="#4f8cff" fmt={(v) => `$${v}`} />
+            </div>
+          </div>
+          <div className="grid md:grid-cols-2 gap-4 mt-4">
+            <div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Avg time in stage</div>
+              <HBars items={pipe.time_in_stage.map((s) => ({ label: pretty(s.status), value: s.avg_secs, hint: fmtDuration(s.avg_secs) }))} color="#4f8cff" />
+            </div>
+            <div>
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Work in progress</div>
+              <HBars items={Object.entries(pipe.wip).filter(([, v]) => v).map(([k, v]) => ({ label: pretty(k), value: v, hint: `${v}` }))} color="#e0a83c" empty="Nothing in the pipeline right now." />
+            </div>
+          </div>
+          {pipe.estimate_vs_actual.length > 0 && (
+            <div className="mt-4">
+              <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Estimate vs actual (pipeline-built)</div>
+              <table className="w-full text-sm">
+                <tbody>
+                  {pipe.estimate_vs_actual.slice(0, 8).map((e) => (
+                    <tr key={e.ref} className="border-t border-slate-100">
+                      <td className="py-1 font-mono text-[11px] text-slate-400">{e.ref}</td>
+                      <td className="py-1 text-right text-slate-500">est {e.estimate}h</td>
+                      <td className={`py-1 text-right ${e.actual > e.estimate ? 'text-rose-600' : 'text-emerald-600'}`}>actual {e.actual}h</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
 
       {/* Ask clarity */}
       <Card title="Ask clarity" hint="Quality of the stories testers write (scored at submit)">
@@ -126,4 +178,65 @@ function Card({ title, hint, children }) {
 function Seg({ n, total, cls, label }) {
   if (!n) return null
   return <div className={cls} style={{ width: `${(n / total) * 100}%` }} title={`${label}: ${n}`} />
+}
+
+// Daily bars (throughput). Inline SVG, no chart lib — matches Profiles.jsx idiom.
+function MiniBars({ data, color, fmt }) {
+  if (!data || !data.length) return <Empty>No data yet.</Empty>
+  const W = 320, H = 72, pad = 4
+  const max = Math.max(1, ...data.map((d) => d.value))
+  const bw = (W - pad * 2) / data.length
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 72 }} preserveAspectRatio="none">
+      {data.map((d, i) => {
+        const h = ((H - pad * 2) * d.value) / max
+        return <rect key={i} x={pad + i * bw + 1} y={H - pad - h} width={Math.max(1, bw - 2)} height={h}
+          rx="2" fill={color}><title>{`${d.date}: ${fmt ? fmt(d.value) : d.value}`}</title></rect>
+      })}
+    </svg>
+  )
+}
+
+// Daily line (cost). Inline SVG polyline + point tooltips.
+function Spark({ data, color, fmt }) {
+  if (!data || !data.length) return <Empty>No data yet.</Empty>
+  const W = 320, H = 72, pad = 5
+  const max = Math.max(1, ...data.map((d) => d.value))
+  const n = data.length
+  const x = (i) => pad + (n === 1 ? (W - pad * 2) / 2 : ((W - pad * 2) * i) / (n - 1))
+  const y = (v) => pad + (H - pad * 2) * (1 - v / max)
+  const pts = data.map((d, i) => `${x(i)},${y(d.value)}`).join(' ')
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 72 }}>
+      {n > 1 && <polyline points={pts} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" />}
+      {data.map((d, i) => (
+        <circle key={i} cx={x(i)} cy={y(d.value)} r="3" fill={color}>
+          <title>{`${d.date}: ${fmt ? fmt(d.value) : d.value}`}</title>
+        </circle>
+      ))}
+    </svg>
+  )
+}
+
+// Horizontal magnitude bars (time-in-stage, WIP).
+function HBars({ items, color, empty }) {
+  if (!items || !items.length) return <Empty>{empty || 'No data yet.'}</Empty>
+  const max = Math.max(1, ...items.map((i) => i.value))
+  return (
+    <div className="space-y-1.5">
+      {items.map((it) => (
+        <div key={it.label} className="flex items-center gap-2 text-xs">
+          <div className="w-24 shrink-0 text-slate-500 capitalize truncate">{it.label}</div>
+          <div className="flex-1 bg-slate-100 rounded h-3 overflow-hidden">
+            <div className="h-3 rounded" style={{ width: `${(it.value / max) * 100}%`, background: color }} title={it.hint} />
+          </div>
+          <div className="w-14 shrink-0 text-right text-slate-500 tabular-nums">{it.hint}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function Empty({ children }) {
+  return <div className="text-sm text-slate-400 italic h-[72px] flex items-center">{children}</div>
 }

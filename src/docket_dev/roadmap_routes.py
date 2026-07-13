@@ -34,6 +34,13 @@ def get_board(tester: dict = Depends(require_tester)):
     return rm.board()
 
 
+@router.get("/analytics")
+def get_analytics(tester: dict = Depends(require_tester)):
+    """Schedule/effort analytics: burndown+ideal+projection, scope-creep, spent-vs-
+    left, per-week loading, and a schedule-health score."""
+    return rm.analytics()
+
+
 class CycleIn(BaseModel):
     name: str = ""
     start_date: str = ""          # ISO date; defaults to today
@@ -55,13 +62,16 @@ class RoadmapPatch(BaseModel):
     week_lane: Optional[int] = None
     estimate_hours: Optional[float] = None
     remaining_hours: Optional[float] = None
+    roadmap_status: Optional[str] = None      # backlog|todo|in_progress|done (manual, never automates)
+    hours_done: Optional[float] = None        # actual effort logged
 
 
 @router.patch("/tickets/{ticket_id}")
 def patch_roadmap(ticket_id: int, body: RoadmapPatch,
                   tester: dict = Depends(require_tester)):
-    """Move a ticket between lanes and/or edit its hours. Forward moves count
-    as bumps and land on the ticket timeline."""
+    """Move a ticket between lanes and/or edit its hours/status. Forward moves
+    count as bumps and land on the ticket timeline. Setting `roadmap_status` is a
+    plain field write — it NEVER queues the ticket or starts the agent."""
     fields = body.dict(exclude_unset=True)   # distinguishes "absent" from null
     if not fields:
         raise HTTPException(status_code=400, detail="nothing to change")
@@ -70,6 +80,41 @@ def patch_roadmap(ticket_id: int, body: RoadmapPatch,
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"ticket": t}
+
+
+class PipelineIn(BaseModel):
+    queue: bool = False      # False = make available (manual Submit); True = queue now
+
+
+@router.post("/tickets/{ticket_id}/pipeline")
+def to_pipeline(ticket_id: int, body: PipelineIn,
+                tester: dict = Depends(require_tester)):
+    """Explicitly hand a roadmap ticket to the automated Docket pipeline (the ONLY
+    way, besides board Submit / greenfield grooming, a ticket becomes automation-
+    eligible). `queue=false` makes it available for a manual Submit; `queue=true`
+    queues it now for the agent."""
+    try:
+        t = rm.send_to_pipeline(ticket_id, queue=body.queue, actor=tester.get("name", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ticket": t}
+
+
+class EstimateIn(BaseModel):
+    ids: Optional[List[int]] = None      # specific tickets; default = all unestimated
+
+
+@router.post("/estimate")
+def auto_estimate(body: EstimateIn, tester: dict = Depends(require_tester)):
+    """Auto-estimate effort hours (via Claude) for the given tickets, or every
+    unestimated open ticket if none are given. Writes estimate_hours + a rationale
+    note on each. Runs server-side; can take a while for a large batch."""
+    from docket_dev import recognize
+    try:
+        estimated = recognize.estimate_tickets(body.ids)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"estimation failed: {e}")
+    return {"estimated": estimated, "count": len(estimated)}
 
 
 @router.post("/rollover")

@@ -213,9 +213,11 @@ class SubmitIn(BaseModel):
 @router.post("/{ticket_id}/submit")
 def submit_for_processing(ticket_id: int, body: SubmitIn,
                           tester: dict = Depends(require_tester)):
-    """Submit for processing: Discussion → Queued. Optionally set priority first."""
+    """Submit for processing: Discussion → Queued. Optionally set priority first.
+    An explicit Submit is an automation opt-in, so it sets dev_optin."""
     if body.priority:
         dk.update_ticket(ticket_id, priority=body.priority)
+    dk.update_ticket(ticket_id, dev_optin=1)   # explicit opt-in to automation
     try:
         dk.transition(ticket_id, "queued", actor=tester.get("name", ""),
                       summary=body.note or "Submitted for processing")
@@ -230,8 +232,12 @@ def run_full_build(tester: dict = Depends(require_tester)):
     (build_seq, then id). Each entry to 'queued' stamps an increasing queue_seq, so
     the agent works them through the pipeline in build order — greenfield projects
     assemble on the base branch ticket-by-ticket. On a `/build/…` path so it never
-    collides with the `/{ticket_id}` routes."""
-    backlog = dk.list_tickets("discussion")
+    collides with the `/{ticket_id}` routes.
+
+    SAFETY: only queues tickets with dev_optin=1 (greenfield grooming / explicit
+    handoff). A ticket a human is working by hand on the roadmap is NEVER swept in."""
+    backlog = [t for t in dk.list_tickets("discussion") if t.get("dev_optin")]
+    skipped = len(dk.list_tickets("discussion")) - len(backlog)
     backlog.sort(key=lambda t: (t.get("build_seq") if t.get("build_seq") is not None
                                 else 10_000, t["id"]))
     queued = 0
@@ -242,7 +248,7 @@ def run_full_build(tester: dict = Depends(require_tester)):
             queued += 1
         except ValueError:
             continue  # e.g. a ticket that can't currently be queued — skip it
-    return {"queued": queued, "total": len(backlog)}
+    return {"queued": queued, "eligible": len(backlog), "skipped_manual": skipped}
 
 
 class TransitionIn(BaseModel):
@@ -263,6 +269,15 @@ def transition_ticket(ticket_id: int, body: TransitionIn,
     # the user-test lead. Shared with the agent's merge reconciler.
     if body.to_status == "user_review":
         dk.enqueue_user_review_notification(dk.get_ticket(ticket_id))
+    # Pipeline completion write-back (covers the PR/human "→ done" path): record
+    # effort + a "Done by Docket pipeline" note, but only for tickets the pipeline
+    # actually built (record_pipeline_done no-ops without agent run-events).
+    if body.to_status == "done":
+        try:
+            from docket_dev import roadmap as rm
+            rm.record_pipeline_done(ticket_id)
+        except Exception:
+            pass
     return {"ticket": _detail(ticket_id)}
 
 

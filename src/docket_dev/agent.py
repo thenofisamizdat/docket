@@ -87,6 +87,17 @@ GITHUB_TOKEN = (os.environ.get("DOCKET_GITHUB_TOKEN")
 MAIL_FROM = os.environ.get("DOCKET_MAIL_FROM", "Docket <docket@localhost>")
 
 
+def _record_roadmap_done(tid: int) -> None:
+    """Write pipeline results back onto the ticket's roadmap card (auto hours + a
+    'Done by Docket pipeline' note). Lazy-imported + best-effort so it can never
+    break the pipeline's terminal path."""
+    try:
+        from docket_dev import roadmap as rm
+        rm.record_pipeline_done(tid)
+    except Exception as e:
+        log(f"  (roadmap write-back skipped: {e})")
+
+
 def _notify_default() -> str:
     """Fallback notification recipient (stalled/pr_ready/needs_info) when a
     ticket has no creator — the configured default, else the first tester."""
@@ -965,6 +976,7 @@ def process_ticket(t: dict) -> None:
                       summary=f"Committed to {BASE_BRANCH} ({head[:7]}) — no PR (direct_main)")
         dk.transition(tid, "done", actor="agent",
                       summary=f"Shipped to {BASE_BRANCH}{pushed_note}")
+        _record_roadmap_done(tid)
         log(f"  → DKT-{tid}: shipped to {BASE_BRANCH} ({head[:7]}){pushed_note} "
             f"[{'verified' if verified else 'UNVERIFIED'}]")
         return
@@ -1010,6 +1022,7 @@ def process_ticket(t: dict) -> None:
                           summary=f"PR #{num} auto-merged")
             dk.transition(tid, "done", actor="agent",
                           summary=f"Auto-merged & shipped (PR #{num})")
+            _record_roadmap_done(tid)
             log(f"  → DKT-{tid}: PR #{num} auto-merged & shipped")
         else:
             log(f"  → DKT-{tid}: auto-merge skipped "

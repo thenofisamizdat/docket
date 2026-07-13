@@ -134,6 +134,67 @@ def seed_tickets(limit: int = 8, on_activity=None) -> List[dict]:
     return created
 
 
+def estimate_tickets(ids: Optional[List[int]] = None, *, on_activity=None) -> List[dict]:
+    """Auto-estimate effort hours for tickets. `ids` limits the set; default is
+    every unestimated open ticket (`estimate_hours IS NULL`). Reuses the read-only
+    Claude + robust-JSON path, grounds on the repo profile, and writes each estimate
+    via roadmap.set_ticket(). Returns [{id, ref, hours, rationale}]."""
+    from docket_dev import roadmap as rm
+    if ids:
+        targets = [dk.get_ticket(i) for i in ids]
+        targets = [t for t in targets if t]
+    else:
+        targets = dk.unestimated_tickets()
+    if not targets:
+        return []
+    targets = targets[:40]                                  # cap a batch
+
+    try:
+        profile = CONFIG.profile_path.read_text()[:3000]
+    except (OSError, FileNotFoundError):
+        profile = ""
+
+    lines = []
+    for t in targets:
+        lines.append(
+            f'- id {t["id"]} [{t["type"]}, {t["priority"]}] {t["title"]}\n'
+            f'    desc: {(t.get("description") or "")[:400]}\n'
+            f'    acceptance: {(t.get("acceptance_criteria") or "")[:300]}')
+    prompt = (
+        "You are estimating engineering effort for these tickets, to be built by a "
+        "capable coding agent on the repo below. For EACH ticket give a realistic "
+        "effort estimate in HOURS (0.5–40; small/typical tasks are 1–6h). Consider "
+        "the acceptance criteria and the codebase.\n\n"
+        + (f"CODEBASE PROFILE:\n{profile}\n\n" if profile else "")
+        + "TICKETS:\n" + "\n".join(lines) + "\n\n"
+        "Return ONLY a JSON array (no prose, no code fences) of objects with keys: "
+        '"id" (the ticket id), "hours" (number), "rationale" (one short sentence).'
+    )
+    res = _read_only_claude(prompt, max_turns=25, budget=3.0, on_activity=on_activity)
+    items = _parse_ticket_array(res.get("text") or "")
+    by_id = {t["id"]: t for t in targets}
+    out = []
+    for it in items:
+        try:
+            tid = int(it.get("id"))
+            hours = round(max(0.0, float(it.get("hours"))), 1)
+        except (TypeError, ValueError):
+            continue
+        if tid not in by_id or hours <= 0:
+            continue
+        try:
+            rm.set_ticket(tid, estimate_hours=hours, actor="docket")
+            rationale = str(it.get("rationale", ""))[:300]
+            if rationale:
+                dk.add_event(tid, "note", actor="docket",
+                             summary=f"Auto-estimated {hours}h — {rationale}")
+            out.append({"id": tid, "ref": by_id[tid]["ref"], "hours": hours,
+                        "rationale": it.get("rationale", "")})
+        except (ValueError, Exception):
+            continue
+    return out
+
+
 def _parse_ticket_array(text: str) -> List[dict]:
     """Best-effort extraction of a JSON array of ticket dicts from model output.
     The groomed array is large, so tolerate a wrapping code fence, prose around the
@@ -207,6 +268,7 @@ def groom_brief(brief_text: str, *, cap: int = 40, on_activity=None) -> List[dic
                 priority=str(it.get("priority", "P2")),
                 created_by="docket",
                 build_seq=build_seq,
+                dev_optin=True,   # greenfield build tickets are meant for the pipeline
             )
             created.append(t)
         except ValueError:

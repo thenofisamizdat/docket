@@ -316,7 +316,13 @@ def init_db() -> None:
                          ("week_lane", "INTEGER"),                         # NULL = backlog; 1..cycle.weeks
                          ("bump_count", "INTEGER NOT NULL DEFAULT 0"),     # times bumped Wn -> Wn+1
                          # Build order for greenfield grooming / "Run Full Build":
-                         ("build_seq", "INTEGER")):                        # 1-based build order; NULL = unset
+                         ("build_seq", "INTEGER"),                         # 1-based build order; NULL = unset
+                         # Interactive roadmap: manual work-state + logged effort, and the
+                         # STRICT automation opt-in gate (a ticket may only be queued/built
+                         # by the agent when dev_optin=1 — set solely by explicit handoff).
+                         ("roadmap_status", "TEXT NOT NULL DEFAULT 'todo'"),  # backlog|todo|in_progress|done
+                         ("hours_done", "REAL"),                             # actual effort logged
+                         ("dev_optin", "INTEGER NOT NULL DEFAULT 0")):       # 1 = eligible for automation
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -374,10 +380,12 @@ def create_ticket(
     created_by: str = "",
     seed_user_item_id: str = "",
     build_seq: Optional[int] = None,
+    dev_optin: bool = False,
 ) -> Dict[str, Any]:
     """Raise a new ticket in the Discussion zone. Returns the created ticket.
     `build_seq` records 1-based build order (set by greenfield grooming; drives
-    "Run Full Build")."""
+    "Run Full Build"). `dev_optin=True` marks the ticket eligible for the automated
+    pipeline — set ONLY by explicit acts (grooming a greenfield build)."""
     title = (title or "").strip()
     if not title:
         raise ValueError("title is required")
@@ -394,11 +402,12 @@ def create_ticket(
             """INSERT INTO tickets
                (title, type, description, acceptance_criteria, clarity_score,
                 clarity_level, priority, status, created_by, seed_user_item_id,
-                build_seq, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?)""",
+                build_seq, dev_optin, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?)""",
             (title[:300], type, str(description)[:20000],
              str(acceptance_criteria)[:10000], clarity["score"], clarity["level"],
-             priority, created_by, seed_user_item_id, build_seq, now, now),
+             priority, created_by, seed_user_item_id, build_seq,
+             1 if dev_optin else 0, now, now),
         )
         tid = cur.lastrowid
         conn.execute(
@@ -447,11 +456,25 @@ def list_tickets(status: Optional[str] = None) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def unestimated_tickets() -> List[Dict[str, Any]]:
+    """Open tickets with no estimate yet (candidates for auto-estimation).
+    Excludes finished/cancelled work."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM tickets WHERE estimate_hours IS NULL "
+            "AND status NOT IN ('done','cancelled') ORDER BY id"
+        ).fetchall()
+        return [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # Fields a caller may patch directly (lifecycle status goes through transition()).
 _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
-    "assignee", "touched_paths", "touched_routes",
+    "assignee", "touched_paths", "touched_routes", "dev_optin",
 }
 
 
@@ -811,6 +834,91 @@ def analytics() -> Dict[str, Any]:
             bounced.append({"ref": ticket_ref(e["ticket_id"]), "title": e.get("tk_title", ""),
                             "kind": "resubmit", "reason": e.get("summary", ""), "ts": e["ts"]})
 
+    # ---- time-series + pipeline health (raw ts data; nothing bucketed before) ----
+    from datetime import datetime as _dt
+    from collections import defaultdict as _dd
+
+    def _date(ts): return (ts or "")[:10]
+
+    def _epoch(ts):
+        try:
+            return _dt.fromisoformat(ts).timestamp()
+        except Exception:
+            return None
+
+    def _pl(e):
+        p = e.get("payload")
+        if isinstance(p, str) and p:
+            try:
+                p = json.loads(p)
+            except ValueError:
+                p = None
+        return p if isinstance(p, dict) else {}
+
+    throughput_by_day: Dict[str, int] = {}
+    cost_by_day: Dict[str, float] = {}
+    for e in evs:
+        if e["kind"] == "transition" and e["phase"] == "done":
+            throughput_by_day[_date(e["ts"])] = throughput_by_day.get(_date(e["ts"]), 0) + 1
+        p = _pl(e)
+        if p.get("cost_usd"):
+            d = _date(e["ts"]); cost_by_day[d] = cost_by_day.get(d, 0.0) + float(p["cost_usd"])
+
+    done_ts: Dict[int, str] = {}
+    for e in evs:
+        if e["kind"] == "transition" and e["phase"] == "done" and e["ticket_id"] not in done_ts:
+            done_ts[e["ticket_id"]] = e["ts"]
+    tk_by_id = {t["id"]: t for t in tickets}
+    cycle_secs, est_actual = [], []
+    for tid, dts in done_ts.items():
+        t = tk_by_id.get(tid)
+        if not t:
+            continue
+        c, d = _epoch(t.get("created_at")), _epoch(dts)
+        if c and d and d >= c:
+            cycle_secs.append(d - c)
+        if t.get("estimate_hours") and t.get("hours_done"):
+            est_actual.append({"ref": ticket_ref(tid),
+                               "estimate": round(float(t["estimate_hours"]), 1),
+                               "actual": round(float(t["hours_done"]), 2)})
+
+    verified = unverified = 0
+    for tid in done_ts:
+        blob = " ".join(str(e.get("summary") or "") for e in evs
+                        if e["ticket_id"] == tid and e["kind"] == "note")
+        if "NOT agent-verified" in blob or "could NOT verify" in blob:
+            unverified += 1
+        elif "agent-verified" in blob or "Verified —" in blob:
+            verified += 1
+
+    per_ticket_trans = _dd(list)
+    for e in evs:
+        if e["kind"] == "transition":
+            per_ticket_trans[e["ticket_id"]].append(e)
+    stage_secs, stage_n = _dd(float), _dd(int)
+    for tl in per_ticket_trans.values():
+        for a, b in zip(tl, tl[1:]):
+            ea, eb = _epoch(a["ts"]), _epoch(b["ts"])
+            if ea and eb and eb >= ea:
+                stage_secs[a["phase"]] += (eb - ea); stage_n[a["phase"]] += 1
+    time_in_stage = [{"status": s, "avg_secs": round(stage_secs[s] / stage_n[s]) if stage_n[s] else 0,
+                      "count": stage_n[s]} for s in MAIN_LINE if s in stage_secs]
+
+    def _series(d):
+        return [{"date": k, "value": round(v, 2)} for k, v in sorted(d.items())]
+
+    pipeline = {
+        "throughput_by_day": _series(throughput_by_day),
+        "cost_by_day": _series(cost_by_day),
+        "avg_cycle_secs": round(sum(cycle_secs) / len(cycle_secs)) if cycle_secs else 0,
+        "cycle_count": len(cycle_secs),
+        "time_in_stage": time_in_stage,
+        "verified": verified, "unverified": unverified,
+        "rework_rate": round(failed_review / total * 100) if total else 0,
+        "estimate_vs_actual": est_actual,
+        "wip": {s: by_status.get(s, 0) for s in MAIN_LINE if s != "done"},
+    }
+
     return {
         "totals": {"total": total, "done": done, "open": total - done, "by_status": by_status},
         "effort": {"total_cost_usd": round(cost, 2), "total_secs": round(secs),
@@ -823,6 +931,7 @@ def analytics() -> Dict[str, Any]:
         "clarity": {"distribution": clar, "avg": round(c_sum / c_n) if c_n else None},
         "per_author": per_author,
         "recently_bounced": bounced,
+        "pipeline": pipeline,
     }
 
 
