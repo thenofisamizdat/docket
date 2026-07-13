@@ -20,6 +20,9 @@ export default function App() {
   const [statusMeta, setStatusMeta] = useState({})
   // Deep-link: /docket/?ticket=N opens that ticket's full detail (used by the
   // roadmap page's "open full ticket" link so there's ONE canonical ticket view).
+  // With &bare=1 the app renders ONLY that detail — the roadmap embeds it in a
+  // modal iframe so the full ticket management view exists there too.
+  const BARE = new URLSearchParams(window.location.search).has('bare')
   const [openId, setOpenId] = useState(() => {
     const p = new URLSearchParams(window.location.search).get('ticket')
     return p ? parseInt(p, 10) : null
@@ -53,7 +56,7 @@ export default function App() {
     let alive = true
     api.meta().then((m) => { if (alive) setMeta(m) }).catch((e) => setErr(e.message))
     loadBoard()
-    const iv = setInterval(() => { if (view === 'board') loadBoard() }, 4000)
+    const iv = setInterval(() => { if (view === 'board' && !BARE) loadBoard() }, 4000)
     return () => { alive = false; clearInterval(iv) }
   }, [authed, loadBoard, view])
 
@@ -64,6 +67,22 @@ export default function App() {
 
   if (!authed) {
     return <Login onAuthed={(n) => { setName(n); setAuthed(true) }} />
+  }
+
+  // Embedded ticket view (roadmap modal iframe): nothing but the detail, and
+  // close/change events go to the host page instead of navigating.
+  if (BARE) {
+    return openId == null ? (
+      <div className="p-8 text-slate-400">No ticket selected.</div>
+    ) : !meta ? (
+      <div className="p-8 text-slate-400">Loading…</div>
+    ) : (
+      <TicketDetail
+        ticketId={openId} meta={meta}
+        onClose={() => window.parent.postMessage('docket-ticket-close', '*')}
+        onChanged={() => window.parent.postMessage('docket-ticket-changed', '*')}
+      />
+    )
   }
 
   const tab = (key, label, Icon) => (

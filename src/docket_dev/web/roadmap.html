@@ -171,6 +171,15 @@
   .pa-bar .t{flex:1;background:var(--bg);border-radius:4px;height:12px;overflow:hidden}
   .pa-bar .t i{display:block;height:12px;border-radius:4px}
   .pa-bar .n{width:54px;text-align:right;color:var(--dim)}
+  /* full ticket view (board SPA embedded bare in an iframe) */
+  #ticketOverlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;
+                 align-items:center;justify-content:center;z-index:60}
+  #ticketOverlay.open{display:flex}
+  #ticketOverlay .tframe-wrap{position:relative;width:min(1150px,97vw);height:94vh}
+  #ticketOverlay iframe{width:100%;height:100%;border:0;border-radius:12px;background:#fff}
+  #ticketOverlay .tframe-x{position:absolute;top:10px;left:12px;z-index:2;
+    background:rgba(15,23,42,.75);color:#fff;border:0;border-radius:8px;
+    padding:5px 11px;font-size:12.5px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -250,6 +259,14 @@
     <button class="primary" type="submit">Create — lanes reset to Backlog</button>
     <button type="button" id="cycleCancel">Cancel</button>
   </form>
+</div>
+
+<!-- full ticket management view — the board SPA's TicketDetail, embedded bare -->
+<div id="ticketOverlay">
+  <div class="tframe-wrap">
+    <button class="tframe-x" id="ticketClose">✕ Close</button>
+    <iframe id="ticketFrame" src="about:blank" title="Ticket detail"></iframe>
+  </div>
 </div>
 
 <script>
@@ -635,9 +652,28 @@ async function sendToPipeline(t, queue){
   } catch(err){ toast(err.message); }
 }
 
-/* A proper ticket view: description, acceptance, a comment box, the full history
-   (markdown-rendered), and a link to the board's full editable detail. */
-async function showNotes(t){
+/* Clicking a ticket opens the SAME full management view as the board — the
+   SPA's TicketDetail rendered bare (/docket/?ticket=N&bare=1) in a modal
+   iframe. Edits/close inside it postMessage back so the roadmap refreshes. */
+function showNotes(t){ openTicketView(t.id); }
+
+function openTicketView(id){
+  document.getElementById("ticketFrame").src = "/docket/?ticket=" + id + "&bare=1";
+  document.getElementById("ticketOverlay").classList.add("open");
+}
+function closeTicketView(){
+  document.getElementById("ticketOverlay").classList.remove("open");
+  document.getElementById("ticketFrame").src = "about:blank";
+  load();
+}
+document.getElementById("ticketClose").addEventListener("click", closeTicketView);
+window.addEventListener("message", e => {
+  if (e.data === "docket-ticket-close") closeTicketView();
+  else if (e.data === "docket-ticket-changed") load();
+});
+
+/* (kept for reference by older links; the modal above is the primary path) */
+async function showNotesLegacy(t){
   openModal(`${t.ref} — ${escapeHtml(t.title)}`, `<div class="tdetail">loading…</div>`,
     [{label:"Close", cls:"", fn: closeModal}], true);
   await renderTicket(t.id);
