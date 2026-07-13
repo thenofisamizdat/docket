@@ -6,15 +6,24 @@
 const TOKEN_KEY = 'docket-token'
 const NAME_KEY = 'docket-name'
 
-export function getToken() { return localStorage.getItem(TOKEN_KEY) || '' }
+// The self-contained pages (/roadmap, /build) log in via the `testing_token`
+// cookie; the SPA uses localStorage. Share the session across both so a deep-link
+// from the roadmap into the board opens the ticket instead of a login screen.
+function cookieToken() {
+  const m = document.cookie.match(/(?:^|;\s*)testing_token=([^;]+)/)
+  return m ? decodeURIComponent(m[1]) : ''
+}
+export function getToken() { return localStorage.getItem(TOKEN_KEY) || cookieToken() }
 export function getName() { return localStorage.getItem(NAME_KEY) || '' }
 export function setSession(token, name) {
   localStorage.setItem(TOKEN_KEY, token)
   localStorage.setItem(NAME_KEY, name || '')
+  document.cookie = 'testing_token=' + token + '; path=/; max-age=' + 7 * 24 * 3600 + '; samesite=lax'
 }
 export function clearSession() {
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(NAME_KEY)
+  document.cookie = 'testing_token=; path=/; max-age=0'
 }
 
 async function req(path, opts = {}) {

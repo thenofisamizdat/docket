@@ -77,7 +77,8 @@
         padding:8px 10px;cursor:grab}
   .card:active{cursor:grabbing}
   .card .ref{font-size:10.5px;color:var(--dim);display:flex;justify-content:space-between;align-items:center}
-  .card .title{font-size:12.8px;margin:3px 0 6px;font-weight:550}
+  .card .title{font-size:12.8px;margin:3px 0 6px;font-weight:550;cursor:pointer}
+  .card .title:hover{color:var(--accent)}
   .card .meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:10.5px}
   .pill{border-radius:20px;padding:1px 8px;border:1px solid var(--line);color:var(--dim)}
   .pill.P0{color:#fff;background:var(--bad);border-color:var(--bad)}
@@ -541,6 +542,7 @@ function card(t, laneId){
   el.addEventListener("dragstart", e => e.dataTransfer.setData("text/plain", String(t.id)));
   el.querySelector(".hours").addEventListener("click", () => editHours(t));
   el.querySelector(".notes").addEventListener("click", () => showNotes(t));
+  el.querySelector(".title").addEventListener("click", () => showNotes(t));   // open the ticket
   const sel = el.querySelector(".rstatus");
   sel.addEventListener("mousedown", e => e.stopPropagation());   // don't start a drag
   sel.addEventListener("change", () => setStatus(t, sel.value));
