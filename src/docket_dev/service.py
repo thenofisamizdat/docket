@@ -223,9 +223,14 @@ _LANES = ("discussion", "queued", "in_progress", "self_review", "pr",
 
 
 def project_summary(root: str | Path) -> Optional[Dict[str, Any]]:
-    """Ticket lane counts + last activity from <root>/.docket/data/docket.db,
-    read-only. None when the DB doesn't exist yet or can't be read."""
-    db = Path(root) / ".docket" / "data" / "docket.db"
+    """Ticket lane counts + last activity from the project's docket.db,
+    read-only. Falls back to the legacy standalone layout (<root>/data/) so
+    pre-package installs still show real counts on the hub. None when no DB
+    exists yet or it can't be read."""
+    root = Path(root)
+    db = root / ".docket" / "data" / "docket.db"
+    if not db.is_file():
+        db = root / "data" / "docket.db"
     if not db.is_file():
         return None
     try:
@@ -260,7 +265,11 @@ def inspect_path(path: str) -> Dict[str, Any]:
 # control-plane admin config (~/.docket/service.toml)
 # ---------------------------------------------------------------------------
 
-def load_service_config() -> Optional[Dict[str, str]]:
+def load_service_config() -> Optional[Dict[str, Any]]:
+    """Hub admin accounts. The primary lives in [admin] (back-compat, also holds
+    the jwt_secret); extra admins are [[admins]] tables. Returns
+    {jwt_secret, admins: [{username, password}, ...]} plus legacy
+    username/password keys mirroring the primary admin."""
     if not SERVICE_TOML.is_file():
         return None
     with open(SERVICE_TOML, "rb") as fh:
@@ -268,29 +277,54 @@ def load_service_config() -> Optional[Dict[str, str]]:
     admin = data.get("admin", {}) or {}
     if not admin.get("username"):
         return None
-    return {"username": admin["username"],
-            "password": admin.get("password", ""),
-            "jwt_secret": admin.get("jwt_secret", "")}
+    admins = [{"username": admin["username"].strip().lower(),
+               "password": admin.get("password", "")}]
+    admins += [{"username": (a.get("username") or "").strip().lower(),
+                "password": a.get("password", "")}
+               for a in (data.get("admins") or []) if a.get("username")]
+    return {"jwt_secret": admin.get("jwt_secret", ""), "admins": admins,
+            "username": admins[0]["username"], "password": admins[0]["password"]}
 
 
-def ensure_service_config() -> Dict[str, str]:
+def _write_service_config(jwt_secret: str, admins: List[Dict[str, str]]) -> None:
+    primary, extras = admins[0], admins[1:]
+    lines = ["# Docket hub admins — managed by `docket admin add` / first `docket service`.",
+             "[admin]",
+             f'username = "{_esc(primary["username"])}"',
+             f'password = "{_esc(primary["password"])}"',
+             f'jwt_secret = "{_esc(jwt_secret)}"', ""]
+    for a in extras:
+        lines += ["[[admins]]",
+                  f'username = "{_esc(a["username"])}"',
+                  f'password = "{_esc(a["password"])}"', ""]
+    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+    SERVICE_TOML.write_text("\n".join(lines))
+
+
+def ensure_service_config() -> Dict[str, Any]:
     """Return the control-plane admin credentials, creating them on first run.
-    Password + secret are generated; stored plaintext in ~/.docket/service.toml
+    Passwords + secret are generated; stored plaintext in ~/.docket/service.toml
     (localhost admin, mirroring how project configs store tester passwords)."""
     existing = load_service_config()
     if existing and existing.get("jwt_secret"):
         return existing
-    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = {"username": "admin",
-           "password": secrets.token_urlsafe(9),
-           "jwt_secret": secrets.token_urlsafe(48)}
-    SERVICE_TOML.write_text(
-        "# Docket control-plane admin — generated on first `docket service`.\n"
-        "[admin]\n"
-        f'username = "{_esc(cfg["username"])}"\n'
-        f'password = "{_esc(cfg["password"])}"\n'
-        f'jwt_secret = "{_esc(cfg["jwt_secret"])}"\n')
-    return cfg
+    _write_service_config(secrets.token_urlsafe(48),
+                          [{"username": "admin", "password": secrets.token_urlsafe(9)}])
+    return load_service_config()
+
+
+def add_admin(username: str, password: Optional[str] = None) -> Dict[str, str]:
+    """Add a hub admin (or reset an existing one's password). Returns the
+    stored {username, password}."""
+    cfg = ensure_service_config()
+    username = username.strip().lower()
+    if not username:
+        raise ValueError("username is required")
+    password = password or secrets.token_urlsafe(9)
+    admins = [a for a in cfg["admins"] if a["username"] != username]
+    admins.append({"username": username, "password": password})
+    _write_service_config(cfg["jwt_secret"], admins)
+    return {"username": username, "password": password}
 
 
 def launch_project(project: Dict[str, Any]) -> subprocess.CompletedProcess:

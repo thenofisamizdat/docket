@@ -246,13 +246,16 @@ async function load(){
   grid.innerHTML = PROJECTS.map(p => {
     const running = p.status === "running";
     const act = p.summary && p.summary.last_activity ? ` · ${ago(p.summary.last_activity)}` : "";
+    // Always build project links from the browser's hostname — p.url says
+    // "localhost", which is dead for anyone viewing the hub remotely.
+    const base = `http://${location.hostname}:${p.port}`;
     let open = "";
     if (running) {
       open = p.has_config
         ? `<button class="primary sm" onclick="openProject('${esc(p.id)}','/docket/')">Open →</button>
            <button class="sm" onclick="openProject('${esc(p.id)}','/roadmap')">Roadmap</button>
            <button class="sm" onclick="openProject('${esc(p.id)}','/build')">Build</button>`
-        : `<a href="${esc(p.url)}/docket" target="_blank"><button class="primary sm">Open ↗</button></a>`;
+        : `<a href="${esc(base)}/docket" target="_blank"><button class="primary sm">Open ↗</button></a>`;
     }
     const toggle = running
       ? `<button class="sm" onclick="ctl('${esc(p.id)}','stop')">Stop</button>`
@@ -287,7 +290,7 @@ async function openProject(id, page){
     window.open(url, "_blank");
   } catch(e){
     const p = PROJECTS.find(x => x.id === id);
-    if (p) window.open(`${p.url}/docket`, "_blank");   // legacy: plain link, sign in there
+    if (p) window.open(`http://${location.hostname}:${p.port}/docket`, "_blank");   // legacy: plain link, sign in there
     else msg(esc(e.message), false);
   }
 }

@@ -518,6 +518,14 @@ def _install_service_unit(host: str, port: int) -> int:
     return 0 if ok else 1
 
 
+def cmd_admin(args) -> int:
+    from docket_dev import service
+    rec = service.add_admin(args.username, args.password)
+    print(f"Hub admin '{rec['username']}' — password: {rec['password']}")
+    print(f"  stored in {service.SERVICE_TOML}; picked up on next login (no restart needed)")
+    return 0
+
+
 def cmd_projects(args) -> int:
     from docket_dev import service
     projects = service.load_projects()
@@ -676,6 +684,12 @@ def build_parser() -> argparse.ArgumentParser:
     psvc.set_defaults(func=cmd_service)
 
     sub.add_parser("projects", help="list registered projects + status").set_defaults(func=cmd_projects)
+
+    padm = sub.add_parser("admin", help="add a hub admin account (or reset its password)")
+    padm.add_argument("action", choices=("add",))
+    padm.add_argument("username")
+    padm.add_argument("--password", help="default: generated")
+    padm.set_defaults(func=cmd_admin)
 
     pu = sub.add_parser("up", help="run web UI + agent")
     pu.add_argument("--daemon", action="store_true",

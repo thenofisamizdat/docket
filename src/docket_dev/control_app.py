@@ -50,11 +50,12 @@ def _make_token(username: str) -> str:
 def _verify(token: str) -> Optional[dict]:
     if not token:
         return None
+    a = _admin()
     try:
-        data = jwt.decode(token, _admin()["jwt_secret"], algorithms=[_ALGO])
+        data = jwt.decode(token, a["jwt_secret"], algorithms=[_ALGO])
     except JWTError:
         return None
-    if data.get("hub") != _HUB or data.get("sub") != _admin()["username"]:
+    if data.get("hub") != _HUB or data.get("sub") not in {x["username"] for x in a["admins"]}:
         return None
     return {"username": data["sub"]}
 
@@ -83,11 +84,13 @@ class LoginIn(BaseModel):
 
 @app.post("/api/service/login")
 def login(body: LoginIn):
-    a = _admin()
-    if body.username.strip() != a["username"] or body.password != a["password"]:
+    uname = body.username.strip().lower()
+    match = next((x for x in _admin()["admins"]
+                  if x["username"] == uname and x["password"] == body.password), None)
+    if not match:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="Invalid username or password")
-    return {"token": _make_token(a["username"]), "username": a["username"]}
+    return {"token": _make_token(uname), "username": uname}
 
 
 # ---------------------------------------------------------------------------
