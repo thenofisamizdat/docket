@@ -7,7 +7,7 @@
   tester login with the main board (Bearer token, mirrored into the
   `testing_token` cookie the backend also accepts).
 
-  Layout: Acklog | Week 1..N | Done, with an always-visible hours-to-completion
+  Layout: Backlog | Week 1..N | Done, with an always-visible hours-to-completion
   counter and a burndown that reacts to bumps, scope injection, and completions.
 -->
 <html lang="en">
@@ -195,7 +195,7 @@
     <label>Start date (Monday)</label><input id="cs" type="date">
     <label>Weeks</label><input id="cw" type="number" value="5" min="1" max="12">
     <div class="err" id="cycleErr"></div>
-    <button class="primary" type="submit">Create — lanes reset to Acklog</button>
+    <button class="primary" type="submit">Create — lanes reset to Backlog</button>
     <button type="button" id="cycleCancel">Cancel</button>
   </form>
 </div>
@@ -271,7 +271,7 @@ function render(){
 
   const board = document.getElementById("board");
   board.innerHTML = "";
-  board.appendChild(lane("backlog", "Acklog", "unscheduled", b.lanes.backlog, false));
+  board.appendChild(lane("backlog", "Backlog", "unscheduled", b.lanes.backlog, false));
   for (const w of (b.weeks || [])){
     const cards = b.lanes["w" + w.week] || [];
     const s = laneSum(cards);
