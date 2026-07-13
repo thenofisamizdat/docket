@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle } from 'lucide-react'
+import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle, CalendarRange, Rocket } from 'lucide-react'
 import { api, getToken, getName, clearSession } from './api.js'
 import Login from './components/Login.jsx'
 import Board from './components/Board.jsx'
@@ -79,6 +79,13 @@ export default function App() {
           {tab('analytics', 'Analytics', BarChart3)}
           {tab('profiles', 'Profiles', Users)}
           {tab('help', 'Help', HelpCircle)}
+          {/* Roadmap + Build are separate self-contained pages, not SPA views. */}
+          <a href="/roadmap" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-slate-500 hover:text-slate-700">
+            <CalendarRange className="w-4 h-4" /> Roadmap
+          </a>
+          <a href="/build" className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-slate-500 hover:text-slate-700">
+            <Rocket className="w-4 h-4" /> Build
+          </a>
         </nav>
         <div className="ml-auto flex items-center gap-2">
           <button onClick={() => openNewTicket()}
