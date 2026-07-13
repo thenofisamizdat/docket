@@ -49,6 +49,8 @@ export const api = {
   ticket: (id) => req(`/api/tickets/${id}`),
   create: (body) => req('/api/tickets', { method: 'POST', body: JSON.stringify(body) }),
   patch: (id, body) => req(`/api/tickets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  roadmapPatch: (id, body) => req(`/api/roadmap/tickets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  toPipeline: (id, queue) => req(`/api/roadmap/tickets/${id}/pipeline`, { method: 'POST', body: JSON.stringify({ queue: !!queue }) }),
   submit: (id, body) => req(`/api/tickets/${id}/submit`, { method: 'POST', body: JSON.stringify(body || {}) }),
   transition: (id, to_status, summary) =>
     req(`/api/tickets/${id}/transition`, { method: 'POST', body: JSON.stringify({ to_status, summary: summary || '' }) }),

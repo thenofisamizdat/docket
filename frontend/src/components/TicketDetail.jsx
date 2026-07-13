@@ -64,6 +64,7 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const [amending, setAmending] = useState(false)
+  const [testers, setTesters] = useState([])
 
   const load = useCallback(async () => {
     try {
@@ -98,6 +99,24 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
     } catch (e) { setErr(e.message) } finally { setBusy(false) }
   }
 
+  useEffect(() => { api.testers().then((r) => setTesters(r.testers || [])).catch(() => {}) }, [])
+
+  async function patch(fields) {
+    setBusy(true); setErr('')
+    try { await api.patch(ticketId, fields); await load(); onChanged && onChanged() }
+    catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+  async function roadmap(fields) {
+    setBusy(true); setErr('')
+    try { await api.roadmapPatch(ticketId, fields); await load(); onChanged && onChanged() }
+    catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+  async function toPipeline(queue) {
+    setBusy(true); setErr('')
+    try { await api.toPipeline(ticketId, queue); await load(); onChanged && onChanged() }
+    catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+
   const meta_status = t ? (meta.status_meta[t.status] || {}) : {}
   const nextMoves = t ? (meta.transitions[t.status] || []) : []
   const effort = t ? computeEffort(t.events) : null
@@ -113,32 +132,25 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
         ) : (
           <>
             {/* Header */}
-            <div className="sticky top-0 bg-white border-b border-slate-200 p-4 flex items-start gap-3">
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="font-mono text-xs text-slate-400">{t.ref}</span>
-                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${PRIORITY_BADGE[t.priority]}`}>{t.priority}</span>
-                  <span className="flex items-center gap-1 text-[11px] text-slate-500">
-                    <span className={`w-2 h-2 rounded-full ${KIND_DOT[meta_status.kind] || 'bg-slate-400'}`} />
-                    {meta_status.label || t.status}
-                  </span>
-                  {t.iteration > 0 && (
-                    <span className="flex items-center gap-0.5 text-[11px] text-slate-500" title="re-submitted">
-                      <RefreshCw className="w-3 h-3" />×{t.iteration}
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-start gap-1.5">
-                  {t.type === 'bug'
-                    ? <Bug className="w-4 h-4 text-rose-500 mt-1 shrink-0" />
-                    : <Sparkles className="w-4 h-4 text-indigo-500 mt-1 shrink-0" />}
-                  <h2 className="text-lg font-semibold text-slate-800 leading-snug">{t.title}</h2>
-                </div>
-              </div>
+            <div className="sticky top-0 bg-white border-b border-slate-200 px-5 py-3 flex items-center gap-2 z-10">
+              <span className="font-mono text-xs text-slate-400">{t.ref}</span>
+              {t.iteration > 0 && (
+                <span className="flex items-center gap-0.5 text-[11px] text-slate-500" title="re-submitted">
+                  <RefreshCw className="w-3 h-3" />×{t.iteration}
+                </span>)}
+              <div className="flex-1" />
               <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button>
             </div>
 
-            <div className="p-4 space-y-4">
+            <div className="flex flex-col md:flex-row">
+              <div className="flex-1 min-w-0 p-5 space-y-4 order-2 md:order-1">
+              <div className="flex items-start gap-2">
+                {t.type === 'bug'
+                  ? <Bug className="w-5 h-5 text-rose-500 mt-1 shrink-0" />
+                  : <Sparkles className="w-5 h-5 text-indigo-500 mt-1 shrink-0" />}
+                <InlineText value={t.title} onSave={(v) => patch({ title: v })}
+                  className="text-xl font-semibold text-slate-800 leading-snug" placeholder="Ticket title" />
+              </div>
               {err && <div className="text-sm text-red-600">{err}</div>}
 
               {/* User Review — the tester's turn */}
@@ -179,41 +191,6 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
                   work have follow-ups against it? */}
               <RelatedPanel t={t} onChanged={async () => { await load(); onChanged && onChanged() }} />
 
-              {/* Lifecycle actions */}
-              {nextMoves.length > 0 && t.status !== 'user_review' && (
-                <div className="flex flex-wrap gap-2">
-                  {nextMoves.map((to) => {
-                    const resubmit = to === 'queued' && RESUBMIT_FROM.includes(t.status)
-                    const cancel = to === 'cancelled'
-                    return (
-                      <button key={to} disabled={busy}
-                        onClick={() => (resubmit ? setAmending(true) : move(to))}
-                        className={`px-3 py-1.5 text-xs font-medium rounded-lg border disabled:opacity-50 ${
-                          cancel
-                            ? 'border-slate-300 text-slate-500 hover:bg-slate-100'
-                            : resubmit
-                            ? 'border-amber-300 text-amber-700 hover:bg-amber-50'
-                            : 'border-indigo-300 text-indigo-700 hover:bg-indigo-50'}`}>
-                        {cancel ? "Won't do" : MOVE_LABEL[`${t.status}->${to}`] || (meta.status_meta[to]?.label) || to}
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-
-              {t.position != null && (
-                <div className="text-sm text-amber-700 bg-amber-50 rounded-lg px-3 py-2">
-                  In the queue — position #{t.position}.
-                </div>
-              )}
-
-              {t.pr_url && (
-                <a href={t.pr_url} target="_blank" rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-sm text-indigo-600 hover:underline">
-                  <ExternalLink className="w-3.5 h-3.5" /> View PR
-                </a>
-              )}
-
               {effort && (
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2">
                   <span className="font-semibold text-indigo-700">Agent effort</span>
@@ -227,8 +204,10 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
                 </div>
               )}
 
-              <Section title="Description" body={t.description} />
-              <Section title="Acceptance criteria" body={t.acceptance_criteria} />
+              <EditableSection title="Description" value={t.description}
+                onSave={(v) => patch({ description: v })} placeholder="Add a description…" />
+              <EditableSection title="Acceptance criteria" value={t.acceptance_criteria}
+                onSave={(v) => patch({ acceptance_criteria: v })} placeholder="Add acceptance criteria…" />
               {t.test_instructions && t.status !== 'user_review' && <Section title="How to test" body={t.test_instructions} />}
 
               {/* History — readable entries (explanations + comments +
@@ -262,6 +241,80 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
                   </button>
                 </div>
               </form>
+              </div>
+
+              {/* Details sidebar */}
+              <aside className="md:w-72 shrink-0 border-t md:border-t-0 md:border-l border-slate-200 bg-slate-50/60 p-5 space-y-3 order-1 md:order-2">
+                <h3 className="text-[11px] font-semibold text-slate-400 uppercase tracking-wide">Details</h3>
+                <Field label="Status">
+                  <div className="flex items-center gap-1.5">
+                    <span className={`w-2 h-2 rounded-full ${KIND_DOT[meta_status.kind] || 'bg-slate-400'}`} />
+                    <span className="text-sm text-slate-700">{meta_status.label || t.status}</span>
+                  </div>
+                </Field>
+                {t.position != null && <div className="text-[11px] text-amber-700 -mt-1">in queue · #{t.position}</div>}
+                {nextMoves.length > 0 && t.status !== 'user_review' && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {nextMoves.map((to) => {
+                      const resubmit = to === 'queued' && RESUBMIT_FROM.includes(t.status)
+                      const cancel = to === 'cancelled'
+                      return (
+                        <button key={to} disabled={busy}
+                          onClick={() => (resubmit ? setAmending(true) : move(to))}
+                          className={`px-2.5 py-1 text-[11px] font-medium rounded-lg border disabled:opacity-50 ${
+                            cancel ? 'border-slate-300 text-slate-500 hover:bg-slate-100'
+                              : resubmit ? 'border-amber-300 text-amber-700 hover:bg-amber-50'
+                              : 'border-indigo-300 text-indigo-700 hover:bg-indigo-50'}`}>
+                          {cancel ? "Won't do" : MOVE_LABEL[`${t.status}->${to}`] || (meta.status_meta[to]?.label) || to}
+                        </button>)
+                    })}
+                  </div>
+                )}
+                <Field label="Assignee">
+                  <InlineSelect value={t.assignee || ''} onSave={(v) => patch({ assignee: v })}
+                    options={[{ value: '', label: '— unassigned' }, ...testers.map((x) => ({ value: x.name || x.username, label: x.name || x.username }))]} />
+                </Field>
+                <Field label="Reporter"><span className="text-sm text-slate-600">{t.created_by || '—'}</span></Field>
+                <Field label="Priority">
+                  <InlineSelect value={t.priority} onSave={(v) => patch({ priority: v })}
+                    options={(meta.priorities || ['P0', 'P1', 'P2', 'P3']).map((p) => ({ value: p, label: p }))} />
+                </Field>
+                <Field label="Type">
+                  <InlineSelect value={t.type} onSave={(v) => patch({ type: v })}
+                    options={(meta.types || ['feature', 'bug']).map((x) => ({ value: x, label: x }))} />
+                </Field>
+                <Field label="Estimate"><InlineNumber value={t.estimate_hours} suffix="h" onSave={(v) => roadmap({ estimate_hours: v })} /></Field>
+                <Field label="Remaining"><InlineNumber value={t.remaining_hours} suffix="h" onSave={(v) => roadmap({ remaining_hours: v })} /></Field>
+                <Field label="Hours done"><InlineNumber value={t.hours_done} suffix="h" onSave={(v) => roadmap({ hours_done: v })} /></Field>
+                <Field label="Roadmap">
+                  <InlineSelect value={t.roadmap_status || 'todo'} onSave={(v) => roadmap({ roadmap_status: v })}
+                    options={[['backlog', 'Backlog'], ['todo', 'To Do'], ['in_progress', 'In Progress'], ['done', 'Done']].map(([v, l]) => ({ value: v, label: l }))} />
+                </Field>
+                {t.week_lane && <Field label="Week"><span className="text-sm text-slate-600">W{t.week_lane}</span></Field>}
+                {t.clarity_score != null && <Field label="Clarity"><span className="text-sm text-slate-600">{t.clarity_score}/100</span></Field>}
+                <Field label="Created"><span className="text-sm text-slate-600">{relTime(t.created_at)}</span></Field>
+                <Field label="Updated"><span className="text-sm text-slate-600">{relTime(t.updated_at)}</span></Field>
+                {t.pr_url && (
+                  <a href={t.pr_url} target="_blank" rel="noreferrer"
+                    className="flex items-center gap-1 text-sm text-indigo-600 hover:underline">
+                    <ExternalLink className="w-3.5 h-3.5" /> View PR
+                  </a>
+                )}
+                {!t.dev_optin && t.status === 'discussion' && (
+                  <div className="pt-2 border-t border-slate-200 space-y-1.5">
+                    <div className="text-[11px] text-slate-400">Automated pipeline</div>
+                    <button onClick={() => toPipeline(false)} disabled={busy}
+                      className="w-full px-2.5 py-1.5 text-[11px] font-medium rounded-lg border border-indigo-300 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50">
+                      → Send to pipeline
+                    </button>
+                    <button onClick={() => toPipeline(true)} disabled={busy}
+                      className="w-full px-2.5 py-1.5 text-[11px] font-medium rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+                      → Queue now (build)
+                    </button>
+                  </div>
+                )}
+                {t.dev_optin === 1 && <div className="text-[11px] text-emerald-600 pt-1">✓ eligible for the automated pipeline</div>}
+              </aside>
             </div>
           </>
         )}
@@ -274,6 +327,97 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
           onDone={async () => { setAmending(false); await load(); onChanged && onChanged() }}
         />
       )}
+    </div>
+  )
+}
+
+// ---- inline editors (click-to-edit) ----
+
+function InlineText({ value, onSave, className, placeholder }) {
+  const [editing, setEditing] = useState(false)
+  const [v, setV] = useState(value || '')
+  useEffect(() => setV(value || ''), [value])
+  if (!editing) {
+    return (
+      <div className={`${className} cursor-text hover:bg-slate-50 rounded px-1 -mx-1 group flex-1`}
+        onClick={() => setEditing(true)} title="click to edit">
+        {value || <span className="text-slate-400 italic font-normal">{placeholder}</span>}
+      </div>
+    )
+  }
+  const commit = () => { setEditing(false); if (v.trim() && v !== value) onSave(v.trim()) }
+  return (
+    <input autoFocus className={`${className} flex-1 border border-indigo-300 rounded px-1 -mx-1 focus:outline-none focus:ring-2 focus:ring-indigo-200`}
+      value={v} onChange={(e) => setV(e.target.value)} onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setV(value || ''); setEditing(false) } }} />
+  )
+}
+
+function EditableSection({ title, value, onSave, placeholder }) {
+  const [editing, setEditing] = useState(false)
+  const [v, setV] = useState(value || '')
+  useEffect(() => setV(value || ''), [value])
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1">
+        <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide">{title}</h3>
+        {!editing && <button onClick={() => setEditing(true)} className="text-[11px] text-indigo-500 hover:text-indigo-700 opacity-70">edit</button>}
+      </div>
+      {editing ? (
+        <div>
+          <textarea autoFocus rows={6} value={v} onChange={(e) => setV(e.target.value)}
+            className="w-full px-3 py-2 border border-indigo-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-200" />
+          <div className="flex gap-2 mt-1.5">
+            <button onClick={() => { setEditing(false); if (v !== (value || '')) onSave(v) }}
+              className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium">Save</button>
+            <button onClick={() => { setV(value || ''); setEditing(false) }}
+              className="px-2.5 py-1 border border-slate-300 text-slate-600 rounded text-xs">Cancel</button>
+          </div>
+        </div>
+      ) : (value && value.trim()
+        ? <div className="cursor-text hover:bg-slate-50 rounded -mx-1 px-1" onClick={() => setEditing(true)}><Markdown>{value}</Markdown></div>
+        : <p className="text-sm text-slate-400 italic cursor-text" onClick={() => setEditing(true)}>{placeholder}</p>)}
+    </div>
+  )
+}
+
+function InlineSelect({ value, onSave, options }) {
+  return (
+    <select value={value} onChange={(e) => e.target.value !== value && onSave(e.target.value)}
+      className="text-sm bg-white border border-slate-200 rounded px-1.5 py-0.5 text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200 max-w-[10rem]">
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  )
+}
+
+function InlineNumber({ value, suffix, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [v, setV] = useState(value ?? '')
+  useEffect(() => setV(value ?? ''), [value])
+  if (!editing) {
+    return (
+      <span className="text-sm text-slate-600 cursor-text hover:bg-slate-100 rounded px-1" onClick={() => setEditing(true)} title="click to edit">
+        {value != null ? `${value}${suffix || ''}` : <span className="text-slate-400 italic">set</span>}
+      </span>
+    )
+  }
+  const commit = () => {
+    setEditing(false)
+    const n = parseFloat(v)
+    if (!isNaN(n) && n >= 0 && n !== value) onSave(n)
+  }
+  return (
+    <input autoFocus type="number" min="0" step="0.5" value={v} onChange={(e) => setV(e.target.value)}
+      onBlur={commit} onKeyDown={(e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false) }}
+      className="w-16 text-sm border border-indigo-300 rounded px-1 py-0.5 focus:outline-none focus:ring-2 focus:ring-indigo-200" />
+  )
+}
+
+function Field({ label, children }) {
+  return (
+    <div className="flex items-start justify-between gap-2">
+      <span className="text-[11px] text-slate-400 pt-0.5 shrink-0">{label}</span>
+      <div className="text-right">{children}</div>
     </div>
   )
 }
