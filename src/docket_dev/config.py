@@ -59,6 +59,11 @@ class Config:
     merge_poll_secs: int = 90
     github_token: str = ""
 
+    # --- auto-deploy (opt-in): after a merge lands on base_branch, the agent
+    #     ff-updates the project working tree and runs deploy_cmd ---
+    deploy_auto: bool = False
+    deploy_cmd: str = ""
+
     # --- mail / telemetry ---
     mail_from: str = "Docket <docket@localhost>"
     telemetry_read_extra: str = ""
@@ -112,6 +117,7 @@ def _from_dict(project_root: Path, data: Dict[str, Any]) -> Config:
     server = data.get("server", {})
     auth = data.get("auth", {})
     agent = data.get("agent", {})
+    deploy = data.get("deploy", {})
     mail = data.get("mail", {})
     tel = data.get("telemetry", {})
     testers = data.get("testers", []) or []
@@ -139,6 +145,8 @@ def _from_dict(project_root: Path, data: Dict[str, Any]) -> Config:
         agent_poll_secs=int(agent.get("poll_secs", 20)),
         merge_poll_secs=int(agent.get("merge_poll_secs", 90)),
         github_token=agent.get("github_token", "") or os.environ.get("DOCKET_GITHUB_TOKEN", ""),
+        deploy_auto=bool(deploy.get("auto", False)),
+        deploy_cmd=deploy.get("cmd", ""),
         mail_from=mail.get("from", "Docket <docket@localhost>"),
         telemetry_read_extra=tel.get("read_extra", ""),
     )
@@ -189,6 +197,10 @@ def to_toml(cfg: Config) -> str:
         f"poll_secs = {cfg.agent_poll_secs}",
         f"merge_poll_secs = {cfg.merge_poll_secs}",
         f'github_token = "{esc(cfg.github_token)}"',
+        "",
+        "[deploy]",
+        f"auto = {str(cfg.deploy_auto).lower()}",
+        f'cmd = "{esc(cfg.deploy_cmd)}"',
         "",
         "[mail]",
         f'from = "{esc(cfg.mail_from)}"',
@@ -267,6 +279,8 @@ def apply_env(cfg: Config) -> None:
         "DOCKET_MAIL_FROM": cfg.mail_from,
         "DOCKET_BASE_BRANCH": cfg.base_branch,
         "DOCKET_REMOTE": cfg.remote,
+        "DOCKET_AUTO_DEPLOY": "1" if cfg.deploy_auto else "0",
+        "DOCKET_DEPLOY_CMD": cfg.deploy_cmd,
     }
     if cfg.github_token:
         env["DOCKET_GITHUB_TOKEN"] = cfg.github_token

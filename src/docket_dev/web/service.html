@@ -154,6 +154,35 @@
   </form>
 </div>
 
+<!-- project settings (merge branch / dev mode / auto-deploy) -->
+<div class="overlay" id="setOverlay" style="display:none">
+  <form class="modal" id="setForm">
+    <h2 id="setTitle">Project settings</h2>
+    <label>Merge branch — PRs target it; auto-deploy watches it</label>
+    <select id="setBranch"></select>
+    <div class="hint" id="setBranchHint"></div>
+    <label>Dev mode</label>
+    <select id="setDev">
+      <option value="pr">pr — branch + PR</option>
+      <option value="auto_merge">auto_merge — branch + PR, auto-merged</option>
+      <option value="direct_main">direct_main — commit straight to the merge branch</option>
+    </select>
+    <label class="check">
+      <input type="checkbox" id="setAuto"> Auto-deploy — when a merge lands on the branch,
+      update the working tree and run the command below
+    </label>
+    <label>Deploy command (optional)</label>
+    <input id="setCmd" placeholder="e.g. sudo systemctl restart my-backend" autocomplete="off">
+    <div class="meta" style="margin-top:8px">Saving restarts the project's Docket services so
+      the agent picks the change up. Deploys are logged to <code>.docket/data/deploys.jsonl</code>.</div>
+    <div class="err" id="setErr"></div>
+    <div class="row">
+      <button type="button" id="setCancel">Cancel</button>
+      <button class="primary" type="submit">Save</button>
+    </div>
+  </form>
+</div>
+
 <!-- greenfield brief editor -->
 <div class="overlay" id="briefOverlay" style="display:none">
   <div class="modal wide">
@@ -262,10 +291,12 @@ async function load(){
     const toggle = running
       ? `<button class="sm" onclick="ctl('${esc(p.id)}','stop')">Stop</button>`
       : `<button class="primary sm" onclick="ctl('${esc(p.id)}','launch')">Launch</button>`;
-    const extras = p.brief_exists
+    const extras = (p.brief_exists
       ? `<button class="sm" onclick="openBrief('${esc(p.id)}')">Brief ✎</button>
          <button class="sm" onclick="groomProject('${esc(p.id)}')">Groom ▶</button>`
-      : "";
+      : "") + (p.has_config
+      ? `<button class="sm" onclick="openSettings('${esc(p.id)}','${esc(p.name)}')" title="Merge branch / dev mode / auto-deploy">⚙</button>`
+      : "");
     // A project with a running install/groom job is locked: one "view log"
     // button, no launch/stop/groom/remove (the backend 409s them too).
     const actions = p.busy_job
@@ -386,6 +417,52 @@ document.getElementById("newForm").addEventListener("submit", async e => {
     }
   } catch(err){ errEl.textContent = err.message; }
   finally { submitBtn.disabled = false; }
+});
+
+/* ---------------- project settings ---------------- */
+let SET_ID = null;
+async function openSettings(id, name){
+  try {
+    const s = await api(`/api/service/projects/${id}/settings`);
+    SET_ID = id;
+    document.getElementById("setTitle").textContent = `Settings — ${name}`;
+    document.getElementById("setBranch").innerHTML = s.branches.map(b =>
+      `<option value="${esc(b)}"${b === s.base_branch ? " selected" : ""}>${esc(b)}</option>`).join("");
+    document.getElementById("setDev").value = s.dev_mode;
+    document.getElementById("setAuto").checked = !!s.auto_deploy;
+    document.getElementById("setCmd").value = s.deploy_cmd || "";
+    document.getElementById("setErr").textContent = "";
+    updateBranchHint(s.current_branch);
+    document.getElementById("setBranch").onchange = () => updateBranchHint(s.current_branch);
+    document.getElementById("setOverlay").style.display = "flex";
+  } catch(e){ msg(esc(e.message), false); }
+}
+function updateBranchHint(cur){
+  const sel = document.getElementById("setBranch").value;
+  const h = document.getElementById("setBranchHint");
+  if (cur && sel && cur !== sel){
+    h.textContent = `⚠ the working tree is checked out on “${cur}” — auto-deploy holds until it's on “${sel}”`;
+    h.className = "hint bad";
+  } else { h.textContent = cur ? `✓ working tree is on ${cur}` : ""; h.className = "hint ok"; }
+}
+document.getElementById("setCancel").addEventListener("click", () => {
+  document.getElementById("setOverlay").style.display = "none";
+});
+document.getElementById("setForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const errEl = document.getElementById("setErr");
+  errEl.textContent = "Saving…";
+  try {
+    const d = await api(`/api/service/projects/${SET_ID}/settings`, {method:"PUT",
+      body: JSON.stringify({
+        base_branch: document.getElementById("setBranch").value,
+        dev_mode: document.getElementById("setDev").value,
+        auto_deploy: document.getElementById("setAuto").checked,
+        deploy_cmd: document.getElementById("setCmd").value })});
+    document.getElementById("setOverlay").style.display = "none";
+    msg(`Settings saved${d.restarted ? " — services restarted" : ""}.`, true);
+    load();
+  } catch(err){ errEl.textContent = err.message; }
 });
 
 /* ---------------- brief editor ---------------- */

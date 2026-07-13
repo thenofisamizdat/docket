@@ -1247,6 +1247,126 @@ def _flagged_incomplete_tip(tid: int) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Auto-deploy — keep the deployed working tree on the tip of BASE_BRANCH
+# ---------------------------------------------------------------------------
+
+AUTO_DEPLOY = os.environ.get("DOCKET_AUTO_DEPLOY", "0") == "1"
+DEPLOY_CMD = os.environ.get("DOCKET_DEPLOY_CMD", "")
+_DEPLOY_STATE = MAIN_CHECKOUT / ".docket" / "data" / "deploy_state.json"
+_DEPLOY_LOG = MAIN_CHECKOUT / ".docket" / "data" / "deploys.jsonl"
+_last_deploy_check = 0.0
+_deploy_warned = ""     # last condition already logged, to avoid spamming
+
+
+def _sh_out(args, cwd) -> str:
+    r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True)
+    return (r.stdout or "").strip()
+
+
+def _deploy_record(entry: dict) -> None:
+    try:
+        _DEPLOY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEPLOY_LOG, "a") as fh:
+            fh.write(json.dumps({"ts": dk.utcnow_iso(), **entry}) + "\n")
+    except OSError:
+        pass
+
+
+def _deploy_state() -> dict:
+    try:
+        return json.loads(_DEPLOY_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_deploy_state(state: dict) -> None:
+    try:
+        _DEPLOY_STATE.parent.mkdir(parents=True, exist_ok=True)
+        _DEPLOY_STATE.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def auto_deploy_tick() -> None:
+    """Opt-in ([deploy] auto=true in config): watch BASE_BRANCH and keep the
+    project's working tree — the deployment — on its tip. When a merge lands:
+    fetch, ff-only update (only while the tree is actually checked out on
+    BASE_BRANCH; otherwise hold and say so), then run the configured deploy
+    command. Every action lands in .docket/data/deploys.jsonl. Also covers
+    direct_main: a local commit advances HEAD, which triggers the deploy cmd."""
+    global _last_deploy_check, _deploy_warned
+    if not AUTO_DEPLOY:
+        return
+    now = time.monotonic()
+    if now - _last_deploy_check < MERGE_POLL_SECS:
+        return
+    _last_deploy_check = now
+    root = MAIN_CHECKOUT
+
+    has_remote = bool(_sh_out(["git", "remote"], root))
+    if has_remote:
+        subprocess.run(["git", "fetch", REMOTE, BASE_BRANCH], cwd=str(root),
+                       capture_output=True, text=True)
+
+    cur = _sh_out(["git", "branch", "--show-current"], root)
+    if cur != BASE_BRANCH:
+        tip = _sh_out(["git", "rev-parse", f"{REMOTE}/{BASE_BRANCH}"], root) if has_remote else ""
+        key = f"held:{cur}:{tip}"
+        if key != _deploy_warned:
+            _deploy_warned = key
+            log(f"auto-deploy HELD: working tree is on '{cur}' but the merge "
+                f"branch is '{BASE_BRANCH}' — check out {BASE_BRANCH} here to deploy.")
+            _deploy_record({"ok": False, "held": True,
+                            "reason": f"tree on '{cur}', target '{BASE_BRANCH}'",
+                            "target_tip": tip})
+        return
+
+    pull_err = ""
+    if has_remote:
+        r = subprocess.run(["git", "merge", "--ff-only", f"{REMOTE}/{BASE_BRANCH}"],
+                           cwd=str(root), capture_output=True, text=True)
+        if r.returncode != 0:
+            pull_err = (r.stderr or r.stdout or "").strip()[-400:]
+    after = _sh_out(["git", "rev-parse", "HEAD"], root)
+
+    state = _deploy_state()
+    if not state.get("last_sha"):
+        # First tick after enabling: baseline on the current tree, don't deploy.
+        _save_deploy_state({"last_sha": after})
+        log(f"auto-deploy armed at {after[:7]} on {BASE_BRANCH}")
+        return
+    if pull_err:
+        key = f"pullfail:{after}"
+        if key != _deploy_warned:
+            _deploy_warned = key
+            log(f"auto-deploy: ff-only update failed (diverged/dirty tree?): {pull_err}")
+            _deploy_record({"ok": False, "pull_error": pull_err, "head": after})
+        return
+    if after == state.get("last_sha"):
+        return
+
+    entry = {"from": state["last_sha"], "to": after}
+    if DEPLOY_CMD:
+        log(f"auto-deploy: {state['last_sha'][:7]} → {after[:7]}, running deploy cmd")
+        try:
+            r = subprocess.run(DEPLOY_CMD, shell=True, cwd=str(root),
+                               capture_output=True, text=True, timeout=600)
+            entry["cmd_rc"] = r.returncode
+            entry["cmd_tail"] = ((r.stdout or "") + (r.stderr or ""))[-600:]
+            entry["ok"] = r.returncode == 0
+        except subprocess.TimeoutExpired:
+            entry["ok"] = False
+            entry["cmd_tail"] = "deploy command timed out after 600s"
+    else:
+        entry["ok"] = True   # pull-only deploy (e.g. a dev server watching the tree)
+        log(f"auto-deploy: updated {state['last_sha'][:7]} → {after[:7]} (no deploy cmd)")
+    _save_deploy_state({"last_sha": after})
+    _deploy_record(entry)
+    if not entry.get("ok"):
+        log(f"auto-deploy: deploy cmd FAILED (rc={entry.get('cmd_rc')}) — see deploys.jsonl")
+
+
 def reconcile_merged_prs() -> None:
     """Detect PRs merged on GitHub and advance their tickets pr -> user_review."""
     global _last_merge_check
@@ -1345,6 +1465,7 @@ def main() -> int:
     while True:
         try:
             reconcile_merged_prs()
+            auto_deploy_tick()
             drain_notifications()
             if not run_once():
                 time.sleep(POLL_SECS)

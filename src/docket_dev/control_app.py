@@ -312,6 +312,61 @@ def sso(project_id: str, body: SsoIn = None, admin: dict = Depends(require_admin
     return {"token": token, "username": username, "name": name, "port": p["port"]}
 
 
+def _settings_payload(p: dict) -> dict:
+    cfg = service.read_project_config(p["root"]) or {}
+    return {"base_branch": cfg.get("base_branch", ""),
+            "dev_mode": cfg.get("dev_mode", p.get("dev_mode", "pr")),
+            "auto_deploy": cfg.get("auto_deploy", False),
+            "deploy_cmd": cfg.get("deploy_cmd", ""),
+            "repo_slug": cfg.get("repo_slug", ""),
+            "current_branch": service.current_branch(p["root"]),
+            "branches": service.list_branches(p["root"]),
+            "running": service.project_status(p) == "running"}
+
+
+@app.get("/api/service/projects/{project_id}/settings")
+def get_settings(project_id: str, admin: dict = Depends(require_admin)):
+    p = _project_or_404(project_id)
+    if not service.read_project_config(p["root"]):
+        raise HTTPException(status_code=409, detail="legacy install — no editable config")
+    return _settings_payload(p)
+
+
+class SettingsIn(BaseModel):
+    base_branch: Optional[str] = None
+    dev_mode: Optional[str] = None
+    auto_deploy: Optional[bool] = None
+    deploy_cmd: Optional[str] = None
+
+
+@app.put("/api/service/projects/{project_id}/settings")
+def put_settings(project_id: str, body: SettingsIn, admin: dict = Depends(require_admin)):
+    """Edit the merge branch (all PRs target it + auto-deploy watches it),
+    dev mode, and auto-deploy. Restarts the project's services when running so
+    the agent actually picks the change up."""
+    p = _project_or_404(project_id)
+    _reject_if_busy(p)
+    if body.base_branch is not None:
+        if body.base_branch.strip() not in service.list_branches(p["root"]):
+            raise HTTPException(status_code=400,
+                                detail=f"branch '{body.base_branch}' not found in the repo")
+    try:
+        service.update_project_config(
+            p["root"], base_branch=(body.base_branch.strip() if body.base_branch is not None else None),
+            dev_mode=body.dev_mode, auto_deploy=body.auto_deploy, deploy_cmd=body.deploy_cmd)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if body.dev_mode is not None:
+        service.register_project(id=p["id"], name=p["name"], kind=p["kind"],
+                                 root=p["root"], port=p["port"], dev_mode=body.dev_mode)
+    restarted = False
+    if service.project_status(p) == "running":
+        service.stop_project(p)
+        service.launch_project(p)
+        restarted = True
+    return {"settings": _settings_payload(p), "restarted": restarted}
+
+
 @app.get("/api/service/projects/{project_id}/brief")
 def get_brief(project_id: str, admin: dict = Depends(require_admin)):
     p = _project_or_404(project_id)
