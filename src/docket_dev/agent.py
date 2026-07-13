@@ -992,9 +992,16 @@ def process_ticket(t: dict) -> None:
         log(f"  → local branch ready (push held): {branch} @ {wt}")
         return
     act("Pushing the branch + opening a PR")
-    pushed = _git(wt, ["push", "-u", REMOTE, branch])
+    # --force-with-lease: docket/* branches are agent-owned. A resubmit after a
+    # base-branch change rebuilds the branch on a new root, which the remote's
+    # stale copy from the previous attempt rejects as non-fast-forward (real
+    # case: DKT-9 re-shipped from main onto the reunion branch). The lease
+    # still refuses to overwrite pushes the agent hasn't seen.
+    pushed = _git(wt, ["push", "-u", "--force-with-lease", REMOTE, branch])
     if not pushed:
-        return recover(t, "push", "git push failed (network blip or GitHub auth)", wt=wt)
+        return recover(t, "push",
+                       "git push failed (stale lease on the docket/* branch, network, or auth)",
+                       wt=wt)
     ref = dk.get_ticket(tid)["ref"]
     pr_url = create_pr(branch, f"{ref}: {t['title']}", pr_body)
     real_pr = bool(pr_url)
