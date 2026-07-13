@@ -24,14 +24,21 @@ from docket_dev.config import CONFIG
 
 
 def _strip_fence(text: str) -> str:
-    """Drop a wrapping ```markdown / ``` code fence if the model added one."""
+    """Drop a wrapping ```markdown / ``` code fence if the model added one —
+    including the "Here is the file: ```…```" shape, where a short line of
+    chatter precedes the fence. Only a fence that closes at the very end with
+    ≤300 chars of preamble is treated as a wrapper, so documents that merely
+    CONTAIN fenced code blocks pass through untouched."""
     t = (text or "").strip()
     if t.startswith("```"):
         lines = t.splitlines()
         lines = lines[1:]                       # drop opening ```lang
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]                  # drop closing ```
-        t = "\n".join(lines).strip()
+        return "\n".join(lines).strip()
+    m = re.match(r"(?s)^.{0,300}?```[a-zA-Z]*\n(.*)\n```\s*$", t)
+    if m:
+        return m.group(1).strip()
     return t
 
 

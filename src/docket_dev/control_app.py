@@ -108,10 +108,10 @@ def _job_public(job: dict) -> dict:
 
 
 def _start_job(kind: str, cmd: list, *, cwd: str | None = None,
-               project_id: str = "") -> dict:
+               project_id: str = "", path: str = "") -> dict:
     job = {"id": uuid.uuid4().hex[:12], "kind": kind, "project_id": project_id,
-           "cmd": " ".join(cmd), "status": "running", "rc": None, "lines": [],
-           "started_at": datetime.utcnow().isoformat(timespec="seconds")}
+           "path": path, "cmd": " ".join(cmd), "status": "running", "rc": None,
+           "lines": [], "started_at": datetime.utcnow().isoformat(timespec="seconds")}
     with _JOBS_LOCK:
         _JOBS[job["id"]] = job
 
@@ -136,6 +136,32 @@ def _start_job(kind: str, cmd: list, *, cwd: str | None = None,
     return _job_public(job)
 
 
+def _busy_job_for(project: dict) -> Optional[dict]:
+    """The running job bound to this project, if any — by id, or by target path
+    for init jobs that registered the project mid-run. While one exists the
+    project must not be launched/stopped/groomed/removed: its .docket state is
+    actively being written, and racing it is how half-installed projects get
+    'launched' by a stray click."""
+    root = str(Path(project.get("root", "")).resolve()) if project.get("root") else ""
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job["status"] != "running":
+                continue
+            if job.get("project_id") and job["project_id"] == project.get("id"):
+                return job
+            if root and job.get("path") and str(Path(job["path"]).resolve()) == root:
+                return job
+    return None
+
+
+def _reject_if_busy(project: dict) -> None:
+    job = _busy_job_for(project)
+    if job:
+        raise HTTPException(status_code=409,
+                            detail=f"a {job['kind']} job is still running for this project — "
+                                   "wait for it to finish (watch its log on the hub)")
+
+
 @app.get("/api/service/jobs")
 def list_jobs(admin: dict = Depends(require_admin)):
     with _JOBS_LOCK:
@@ -158,11 +184,13 @@ def get_job(job_id: str, admin: dict = Depends(require_admin)):
 def _with_status(p: dict) -> dict:
     root = p.get("root", "")
     cfg = service.read_project_config(root)
+    busy = _busy_job_for(p)
     return {**p, "status": service.project_status(p),
             "url": f"http://localhost:{p.get('port')}",
             "has_config": bool(cfg and cfg.get("jwt_secret")),
             "brief_exists": (Path(root) / "PROJECT_BRIEF.md").is_file(),
-            "summary": service.project_summary(root)}
+            "summary": service.project_summary(root),
+            "busy_job": {"id": busy["id"], "kind": busy["kind"]} if busy else None}
 
 
 @app.get("/api/service/projects")
@@ -225,6 +253,12 @@ def init_existing(body: InitProjectIn, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail=f"{info['path']} is not a folder on this machine")
     if info["has_docket"]:
         raise HTTPException(status_code=409, detail="Docket is already installed there")
+    with _JOBS_LOCK:
+        dup = next((j for j in _JOBS.values() if j["status"] == "running" and
+                    j.get("path") and str(Path(j["path"]).resolve()) == str(Path(info["path"]).resolve())), None)
+    if dup:
+        raise HTTPException(status_code=409,
+                            detail="an install is already running for that folder — watch its log instead of starting another")
     if not info["is_git"]:
         if not body.git_init:
             raise HTTPException(status_code=409,
@@ -237,7 +271,8 @@ def init_existing(body: InitProjectIn, admin: dict = Depends(require_admin)):
         if r.returncode != 0:
             raise HTTPException(status_code=500,
                                 detail=(r.stderr or "git init failed").strip()[:300])
-    job = _start_job("init", ["docket", "init", info["path"], "--dev-mode", body.dev_mode])
+    job = _start_job("init", ["docket", "init", info["path"], "--dev-mode", body.dev_mode],
+                     path=info["path"])
     return {"job": job}
 
 
@@ -301,6 +336,7 @@ class GroomIn(BaseModel):
 @app.post("/api/service/projects/{project_id}/groom")
 def groom(project_id: str, body: GroomIn = None, admin: dict = Depends(require_admin)):
     p = _project_or_404(project_id)
+    _reject_if_busy(p)
     cap = max(1, min((body.cap if body else 40) or 40, 100))
     job = _start_job("groom", ["docket", "groom", "--cap", str(cap)],
                      cwd=p["root"], project_id=p["id"])
@@ -312,6 +348,7 @@ def remove(project_id: str, admin: dict = Depends(require_admin)):
     """Unregister from the hub (stops its services first). Never touches the
     project's files — .docket/, tickets and code all stay on disk."""
     p = _project_or_404(project_id)
+    _reject_if_busy(p)
     service.stop_project(p)
     return {"ok": service.remove_project(project_id)}
 
@@ -319,6 +356,7 @@ def remove(project_id: str, admin: dict = Depends(require_admin)):
 @app.post("/api/service/projects/{project_id}/launch")
 def launch(project_id: str, admin: dict = Depends(require_admin)):
     p = _project_or_404(project_id)
+    _reject_if_busy(p)
     r = service.launch_project(p)
     return {"ok": r.returncode == 0,
             "detail": (r.stdout or r.stderr or "").strip()[-500:],
@@ -328,6 +366,7 @@ def launch(project_id: str, admin: dict = Depends(require_admin)):
 @app.post("/api/service/projects/{project_id}/stop")
 def stop(project_id: str, admin: dict = Depends(require_admin)):
     p = _project_or_404(project_id)
+    _reject_if_busy(p)
     r = service.stop_project(p)
     return {"ok": r.returncode == 0,
             "detail": (r.stdout or r.stderr or "").strip()[-500:],

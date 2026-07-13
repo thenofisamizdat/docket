@@ -264,17 +264,28 @@ async function load(){
       ? `<button class="sm" onclick="openBrief('${esc(p.id)}')">Brief ✎</button>
          <button class="sm" onclick="groomProject('${esc(p.id)}')">Groom ▶</button>`
       : "";
+    // A project with a running install/groom job is locked: one "view log"
+    // button, no launch/stop/groom/remove (the backend 409s them too).
+    const actions = p.busy_job
+      ? `<button class="sm" onclick="watchJobById('${esc(p.busy_job.id)}','${esc(p.busy_job.kind)} — ${esc(p.name)}')">⏳ ${esc(p.busy_job.kind)} running… view log</button>`
+      : `${open}${toggle}${extras}`;
+    const removeX = p.busy_job ? "" :
+      `<span class="x" title="Remove from hub (files stay on disk)"
+            onclick="removeProject('${esc(p.id)}','${esc(p.name)}')">✕</span>`;
     return `<div class="card">
-      <h3>${esc(p.name)}<span class="x" title="Remove from hub (files stay on disk)"
-            onclick="removeProject('${esc(p.id)}','${esc(p.name)}')">✕</span></h3>
+      <h3>${esc(p.name)}${removeX}</h3>
       <div class="meta"><span class="dot ${esc(p.status)}"></span>${esc(p.status)}
         · <span class="badge">${esc(p.kind)}</span>
         · :${esc(String(p.port))} · ${esc(p.dev_mode)}${act}</div>
       <div class="lanes">${laneChips(p.summary)}</div>
-      <div class="actions">${open}${toggle}${extras}</div>
+      <div class="actions">${actions}</div>
     </div>`;
   }).join("");
+  // While anything is busy, keep the grid fresh so cards unlock on their own.
+  clearTimeout(busyTimer);
+  if (PROJECTS.some(p => p.busy_job)) busyTimer = setTimeout(load, 5000);
 }
+let busyTimer = null;
 
 async function ctl(id, action){
   try { await api(`/api/service/projects/${id}/${action}`, {method:"POST", body:"{}"});
@@ -343,6 +354,9 @@ async function validatePath(){
 
 document.getElementById("newForm").addEventListener("submit", async e => {
   e.preventDefault();
+  const submitBtn = document.getElementById("newSubmit");
+  if (submitBtn.disabled) return;          // double-click guard
+  submitBtn.disabled = true;
   const errEl = document.getElementById("newErr");
   const dev = document.getElementById("ndev").value;
   try {
@@ -365,8 +379,10 @@ document.getElementById("newForm").addEventListener("submit", async e => {
       nOverlay.style.display = "none";
       document.getElementById("newForm").reset(); setTab("green");
       watchJob(d.job, "Installing Docket");
+      load();
     }
   } catch(err){ errEl.textContent = err.message; }
+  finally { submitBtn.disabled = false; }
 });
 
 /* ---------------- brief editor ---------------- */
@@ -402,11 +418,22 @@ document.getElementById("briefGroom").addEventListener("click", async () => {
     await groomProject(id);
   } catch(e){ errEl.textContent = e.message; }
 });
+let GROOM_INFLIGHT = false;
 async function groomProject(id){
+  if (GROOM_INFLIGHT) return;
+  if (!confirm(`Groom “${id}”?\n\nThis reads its PROJECT_BRIEF.md and drafts NEW tickets into the backlog (it runs Claude, a minute or two). Cancel if you were just looking around.`)) return;
+  GROOM_INFLIGHT = true;
   try {
     const d = await api(`/api/service/projects/${id}/groom`, {method:"POST", body:"{}"});
     watchJob(d.job, `Grooming ${id}`);
+    load();
   } catch(e){ msg(esc(e.message), false); }
+  finally { GROOM_INFLIGHT = false; }
+}
+
+async function watchJobById(id, title){
+  try { watchJob(await api(`/api/service/jobs/${id}`), title); }
+  catch(e){ msg(esc(e.message), false); }
 }
 
 /* ---------------- job drawer ---------------- */
