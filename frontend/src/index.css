@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: #f1f5f9; /* slate-100 */
+}
+
+/* Thin, unobtrusive scrollbars for the horizontal board. */
+.board-scroll::-webkit-scrollbar { height: 10px; }
+.board-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 6px; }
+.board-scroll::-webkit-scrollbar-track { background: transparent; }
