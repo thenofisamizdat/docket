@@ -164,24 +164,52 @@ def _snapshot(bumps_increment: int = 0) -> None:
             (cycle["id"], today, tot["scope"],
              tot["remaining"], bumps_increment, bumps_increment),
         )
-        # Per-epic rows: rewrite today's set wholesale so tickets moving between
-        # epics (or an epic being emptied) can't leave stale rows behind.
-        per: Dict[int, List[float]] = {}
+        # Per-epic and per-assignee rows: rewrite today's sets wholesale so a
+        # ticket moving between epics/people (or a group being emptied) can't
+        # leave stale rows behind.
+        per_epic: Dict[int, List[float]] = {}
+        per_user: Dict[str, List[float]] = {}
         for t in _lane_tickets(conn):
             if t["status"] == _VOID:
                 continue
-            eid = int(t.get("epic_id") or 0)
-            acc = per.setdefault(eid, [0.0, 0.0])
-            acc[0] += float(t.get("estimate_hours") or 0.0)
-            acc[1] += _effective_remaining(t)
+            est = float(t.get("estimate_hours") or 0.0)
+            rem = _effective_remaining(t)
+            acc = per_epic.setdefault(int(t.get("epic_id") or 0), [0.0, 0.0])
+            acc[0] += est; acc[1] += rem
+            acc = per_user.setdefault((t.get("assignee") or "").strip(), [0.0, 0.0])
+            acc[0] += est; acc[1] += rem
         conn.execute("DELETE FROM roadmap_epic_snapshots WHERE cycle_id=? AND date=?",
                      (cycle["id"], today))
         conn.executemany(
             "INSERT INTO roadmap_epic_snapshots (cycle_id, date, epic_id, "
             "total_scope, total_remaining) VALUES (?,?,?,?,?)",
             [(cycle["id"], today, eid, round(v[0], 2), round(v[1], 2))
-             for eid, v in per.items()])
+             for eid, v in per_epic.items()])
+        conn.execute("DELETE FROM roadmap_user_snapshots WHERE cycle_id=? AND date=?",
+                     (cycle["id"], today))
+        conn.executemany(
+            "INSERT INTO roadmap_user_snapshots (cycle_id, date, assignee, "
+            "total_scope, total_remaining) VALUES (?,?,?,?,?)",
+            [(cycle["id"], today, u, round(v[0], 2), round(v[1], 2))
+             for u, v in per_user.items()])
         conn.commit()
+    finally:
+        conn.close()
+
+
+def user_snapshots(cycle_id: int, assignee: Optional[str] = None) -> List[Dict[str, Any]]:
+    """The per-assignee burndown series for a cycle — one person's rows, or all."""
+    conn = _connect()
+    try:
+        if assignee is None:
+            rows = conn.execute(
+                "SELECT * FROM roadmap_user_snapshots WHERE cycle_id=? "
+                "ORDER BY date ASC, assignee ASC", (cycle_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM roadmap_user_snapshots WHERE cycle_id=? AND assignee=? "
+                "ORDER BY date ASC", (cycle_id, assignee.strip())).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -563,11 +591,17 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
                           "on_track": bool(on_track)}}
 
     # All-epics mode: ship every epic's series so the chart can draw one
-    # burndown line per epic (keyed by epic_id; 0 = no epic).
+    # burndown line per epic (keyed by epic_id; 0 = no epic), and every
+    # assignee's series for the by-person chart ('' = unassigned).
     epic_series: Dict[int, List[Dict[str, Any]]] = {}
+    user_series: Dict[str, List[Dict[str, Any]]] = {}
     if not epic_id and cycle:
         for s in epic_snapshots(cycle["id"]):
             epic_series.setdefault(int(s["epic_id"]), []).append(
+                {"date": s["date"], "scope": s["total_scope"],
+                 "remaining": s["total_remaining"]})
+        for s in user_snapshots(cycle["id"]):
+            user_series.setdefault(s["assignee"], []).append(
                 {"date": s["date"], "scope": s["total_scope"],
                  "remaining": s["total_remaining"]})
 
@@ -579,4 +613,85 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
         "week_load": week_load, "creep": creep, "forecast": forecast, "health": health,
         "ideal_remaining_now": round(ideal_remaining, 1),
         "epic_series": epic_series,
+        "user_series": user_series,
     }
+
+
+def user_stats(testers: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Rich per-person workload stats for the People view: assignment counts,
+    hours maths, per-week loading, bump churn, type mix, a personal burndown
+    series (from the per-assignee snapshots), and a velocity-based forecast.
+
+    Users = every configured tester (display name) plus any assignee value
+    found on tickets, plus an "" bucket for unassigned work — so a person with
+    zero tickets still appears as an assignable row."""
+    b = board()
+    cycle, weeks, wk = b["cycle"], b["weeks"], int(b["current_week"] or 0)
+    n_weeks = int(cycle["weeks"]) if cycle else 0
+    all_t = [t for lane in b["lanes"].values() for t in lane]
+
+    names: List[str] = []
+    for t in testers or []:
+        nm = (t.get("name") or t.get("username") or "").strip()
+        if nm and nm not in names:
+            names.append(nm)
+    for t in all_t:
+        nm = (t.get("assignee") or "").strip()
+        if nm and nm not in names:
+            names.append(nm)
+    names.append("")                       # unassigned bucket, always last
+
+    users: List[Dict[str, Any]] = []
+    for name in names:
+        cards = [t for t in all_t if (t.get("assignee") or "").strip() == name]
+        live = [t for t in cards if t["status"] != _VOID]
+        est = sum(float(t.get("estimate_hours") or 0) for t in live)
+        left = sum(float(t.get("effective_remaining") or 0)
+                   for t in live if not _is_done(t))
+        spent = sum(float(t.get("hours_done") or 0) for t in live)
+        done_ct = sum(1 for t in live if _is_done(t))
+        by_type: Dict[str, int] = {}
+        for t in live:
+            by_type[t["type"]] = by_type.get(t["type"], 0) + 1
+        week_load = []
+        for w in weeks:
+            wc = [t for t in live if t.get("week_lane") == w["week"]]
+            week_load.append({
+                "week": w["week"], "is_current": w["is_current"],
+                "estimate": round(sum(float(t.get("estimate_hours") or 0) for t in wc), 1),
+                "remaining": round(sum(float(t.get("effective_remaining") or 0)
+                                       for t in wc if not _is_done(t)), 1),
+                "count": len(wc)})
+        series = ([{"date": s["date"], "scope": s["total_scope"],
+                    "remaining": s["total_remaining"]}
+                   for s in user_snapshots(cycle["id"], name)] if cycle else [])
+        # Velocity over the observed series span (hours burned per week).
+        velocity = 0.0
+        if len(series) >= 2:
+            span_days = (date.fromisoformat(series[-1]["date"])
+                         - date.fromisoformat(series[0]["date"])).days
+            burned = max(0.0, series[0]["remaining"] - series[-1]["remaining"])
+            if span_days > 0:
+                velocity = burned / span_days * 7.0
+        weeks_left = (left / velocity) if velocity > 0 else None
+        forecast_week = round(wk + weeks_left, 1) if weeks_left is not None else None
+        users.append({
+            "name": name or "",                 # "" = unassigned
+            "tickets": len(live),
+            "open": len(live) - done_ct,
+            "done_count": done_ct,
+            "backlog": sum(1 for t in live if not t.get("week_lane") and not _is_done(t)),
+            "estimate": round(est, 1),
+            "remaining": round(left, 1),
+            "hours_done": round(spent, 1),
+            "pct_done": round((est - left) / est * 100, 1) if est else 0.0,
+            "bumps": sum(int(t.get("bump_count") or 0) for t in live),
+            "by_type": by_type,
+            "week_load": week_load,
+            "series": series,
+            "velocity_per_week": round(velocity, 1),
+            "forecast_finish_week": forecast_week,
+            "on_track": bool(forecast_week is not None and n_weeks
+                             and forecast_week <= n_weeks) if left > 0 else True,
+        })
+    return {"cycle": cycle, "current_week": wk, "weeks": weeks, "users": users}

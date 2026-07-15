@@ -44,6 +44,15 @@ def get_analytics(epic_id: Optional[int] = None,
     return rm.analytics(epic_id=epic_id)
 
 
+@router.get("/users")
+def get_user_stats(tester: dict = Depends(require_tester)):
+    """Per-person workload stats for the People view: assignment counts, hours
+    maths, per-week loading, personal burndown series, velocity + forecast.
+    Includes every configured tester plus an unassigned bucket."""
+    from docket_dev import auth as testing_auth
+    return rm.user_stats(testing_auth.all_testers())
+
+
 class CycleIn(BaseModel):
     name: str = ""
     start_date: str = ""          # ISO date; defaults to today

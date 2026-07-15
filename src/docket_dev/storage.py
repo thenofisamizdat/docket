@@ -314,6 +314,16 @@ CREATE TABLE IF NOT EXISTS roadmap_epic_snapshots (
     PRIMARY KEY (cycle_id, date, epic_id)
 );
 
+-- And the same again per assignee ('' = unassigned) for per-person burndowns.
+CREATE TABLE IF NOT EXISTS roadmap_user_snapshots (
+    cycle_id        INTEGER NOT NULL REFERENCES roadmap_cycles(id) ON DELETE CASCADE,
+    date            TEXT NOT NULL,
+    assignee        TEXT NOT NULL DEFAULT '',
+    total_scope     REAL NOT NULL DEFAULT 0,
+    total_remaining REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (cycle_id, date, assignee)
+);
+
 -- Epics: named, color-coded groupings of tickets (e.g. "Cellebrite",
 -- "Financial"). A ticket belongs to at most one epic (tickets.epic_id).
 CREATE TABLE IF NOT EXISTS epics (
