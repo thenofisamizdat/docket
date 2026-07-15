@@ -301,6 +301,19 @@ CREATE TABLE IF NOT EXISTS roadmap_snapshots (
     PRIMARY KEY (cycle_id, date)
 );
 
+-- Same daily burndown maths, broken out per epic (epic_id 0 = tickets with no
+-- epic), so an epic-filtered roadmap gets a real historical series instead of
+-- projection-only. Rewritten (delete+insert) for today on every snapshot, so a
+-- ticket moving between epics never leaves a stale row behind.
+CREATE TABLE IF NOT EXISTS roadmap_epic_snapshots (
+    cycle_id        INTEGER NOT NULL REFERENCES roadmap_cycles(id) ON DELETE CASCADE,
+    date            TEXT NOT NULL,
+    epic_id         INTEGER NOT NULL DEFAULT 0,
+    total_scope     REAL NOT NULL DEFAULT 0,
+    total_remaining REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (cycle_id, date, epic_id)
+);
+
 -- Epics: named, color-coded groupings of tickets (e.g. "Cellebrite",
 -- "Financial"). A ticket belongs to at most one epic (tickets.epic_id).
 CREATE TABLE IF NOT EXISTS epics (

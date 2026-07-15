@@ -144,10 +144,12 @@ def _totals(conn) -> Dict[str, float]:
 
 
 def _snapshot(bumps_increment: int = 0) -> None:
-    """Upsert today's burndown row for the active cycle (no-op without one)."""
+    """Upsert today's burndown row for the active cycle (no-op without one),
+    plus the per-epic breakdown rows (epic_id 0 = no epic)."""
     cycle = get_cycle()
     if not cycle:
         return
+    today = date.today().isoformat()
     conn = _connect()
     try:
         tot = _totals(conn)
@@ -159,10 +161,45 @@ def _snapshot(bumps_increment: int = 0) -> None:
                    total_scope=excluded.total_scope,
                    total_remaining=excluded.total_remaining,
                    bumps=roadmap_snapshots.bumps+?""",
-            (cycle["id"], date.today().isoformat(), tot["scope"],
+            (cycle["id"], today, tot["scope"],
              tot["remaining"], bumps_increment, bumps_increment),
         )
+        # Per-epic rows: rewrite today's set wholesale so tickets moving between
+        # epics (or an epic being emptied) can't leave stale rows behind.
+        per: Dict[int, List[float]] = {}
+        for t in _lane_tickets(conn):
+            if t["status"] == _VOID:
+                continue
+            eid = int(t.get("epic_id") or 0)
+            acc = per.setdefault(eid, [0.0, 0.0])
+            acc[0] += float(t.get("estimate_hours") or 0.0)
+            acc[1] += _effective_remaining(t)
+        conn.execute("DELETE FROM roadmap_epic_snapshots WHERE cycle_id=? AND date=?",
+                     (cycle["id"], today))
+        conn.executemany(
+            "INSERT INTO roadmap_epic_snapshots (cycle_id, date, epic_id, "
+            "total_scope, total_remaining) VALUES (?,?,?,?,?)",
+            [(cycle["id"], today, eid, round(v[0], 2), round(v[1], 2))
+             for eid, v in per.items()])
         conn.commit()
+    finally:
+        conn.close()
+
+
+def epic_snapshots(cycle_id: int, epic_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """The per-epic burndown series for a cycle — one epic's rows, or all of
+    them (for the multi-line by-epic burndown)."""
+    conn = _connect()
+    try:
+        if epic_id is None:
+            rows = conn.execute(
+                "SELECT * FROM roadmap_epic_snapshots WHERE cycle_id=? "
+                "ORDER BY date ASC, epic_id ASC", (cycle_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM roadmap_epic_snapshots WHERE cycle_id=? AND epic_id=? "
+                "ORDER BY date ASC", (cycle_id, int(epic_id))).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
@@ -446,10 +483,10 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
     ideal + a velocity projection), scope-creep, spent-vs-left, per-week loading, and
     a composite schedule-health score. Reuses board() + the snapshot series.
 
-    With `epic_id`, every number is computed over that epic's tickets only. The
-    daily snapshots are cycle-global (no epic dimension), so the historical
-    burndown series is dropped — the chart shows ideal + live projection from
-    current state instead, and scope-creep reports zero injected."""
+    With `epic_id`, every number is computed over that epic's tickets only,
+    and the burndown series comes from the per-epic snapshot rows (history
+    accumulates from the day the epic first had week-lane tickets). Without
+    one, `epic_series` carries every epic's series for the by-epic chart."""
     b = board()
     if epic_id:
         b["lanes"] = {k: [t for t in v if t.get("epic_id") == epic_id]
@@ -459,7 +496,11 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
         b["total_scope"] = sum(float(t.get("estimate_hours") or 0) for t in live)
         b["hours_to_completion"] = sum(float(t.get("effective_remaining") or 0)
                                        for t in live if not _is_done(t))
-        b["snapshots"] = []
+        b["snapshots"] = [
+            {"cycle_id": s["cycle_id"], "date": s["date"],
+             "total_scope": s["total_scope"], "total_remaining": s["total_remaining"],
+             "bumps": 0}
+            for s in (epic_snapshots(b["cycle"]["id"], epic_id) if b["cycle"] else [])]
     cycle = b["cycle"]
     weeks = b["weeks"]
     snaps = b["snapshots"]
@@ -521,6 +562,15 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
                           "injected_hours": creep["injected"], "bumps": bumps_total,
                           "on_track": bool(on_track)}}
 
+    # All-epics mode: ship every epic's series so the chart can draw one
+    # burndown line per epic (keyed by epic_id; 0 = no epic).
+    epic_series: Dict[int, List[Dict[str, Any]]] = {}
+    if not epic_id and cycle:
+        for s in epic_snapshots(cycle["id"]):
+            epic_series.setdefault(int(s["epic_id"]), []).append(
+                {"date": s["date"], "scope": s["total_scope"],
+                 "remaining": s["total_remaining"]})
+
     return {
         "cycle": cycle, "weeks": weeks, "current_week": wk, "snapshots": snaps,
         "totals": {"scope": round(scope, 1), "remaining": round(remaining, 1),
@@ -528,4 +578,5 @@ def analytics(epic_id: Optional[int] = None) -> Dict[str, Any]:
                    "open_count": open_ct, "pct_done": pct_done},
         "week_load": week_load, "creep": creep, "forecast": forecast, "health": health,
         "ideal_remaining_now": round(ideal_remaining, 1),
+        "epic_series": epic_series,
     }

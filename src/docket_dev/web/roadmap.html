@@ -68,12 +68,25 @@
   #board{display:flex;gap:10px;padding:14px 20px 24px;overflow-x:auto;align-items:flex-start}
   .lane{background:var(--panel);border:1px solid var(--line);border-radius:12px;
         min-width:230px;width:230px;flex:0 0 auto;display:flex;flex-direction:column;max-height:calc(100vh - 320px)}
-  /* epic view — one lane per epic, colored, hierarchy-aware */
+  /* epic view — a matrix: one ROW per epic, the week swimlanes as COLUMNS,
+     cards at the (epic, week) intersections. */
   .viewtoggle{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
   .viewtoggle button{border:0;border-radius:0;padding:7px 12px;background:transparent}
   .viewtoggle button.active{background:var(--accent);color:#fff}
-  #board.epics .lane{width:300px;min-width:300px}
-  .lane.epic-lane{border-top:3px solid var(--line)}
+  #board.epics{display:block}
+  .matrix{display:grid;gap:8px;min-width:max-content;align-items:stretch}
+  .mx-corner,.mx-col{font-size:12px;color:var(--dim);padding:4px 6px 2px;font-weight:650}
+  .mx-col .d{font-weight:400;font-size:10.5px}
+  .mx-col.current{color:var(--accent)}
+  .mx-epic{position:sticky;left:0;z-index:2;background:var(--panel);border:1px solid var(--line);
+           border-radius:12px;border-top:3px solid var(--line);padding:10px 12px;align-self:stretch}
+  .mx-corner{position:sticky;left:0;z-index:2;background:var(--bg)}
+  .mx-cell{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+           min-height:64px;display:flex;flex-direction:column}
+  .mx-cell.current{border-color:var(--accent)}
+  .mx-cell.dragover{background:var(--panel2);border-color:var(--accent)}
+  .mx-cell .cards{padding:6px;gap:6px;overflow:visible;min-height:0;flex:1}
+  .mx-cell .empty{padding:8px 4px}
   .epic-stats{display:flex;gap:10px;margin-top:4px;font-size:11px;color:var(--dim)}
   .epic-stats b{color:var(--text);font-weight:650}
   .ebar{height:5px;border-radius:4px;background:var(--bg);overflow:hidden;margin-top:7px}
@@ -443,6 +456,8 @@ function renderAnalytics(){
   card.className = "acard health " + (a.health.score >= 75 ? "ok" : a.health.score >= 50 ? "warn" : "bad");
 }
 
+const epicColor = id => (id ? ((EPICS.find(e => e.id === +id) || {}).color || "#8b96ab") : "#8b96ab");
+
 function drawWeekLoad(){
   const c = document.getElementById("weekload");
   const a = ANALYTICS;
@@ -451,6 +466,11 @@ function drawWeekLoad(){
   c.width = W * dpr; c.height = H * dpr;
   const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
   const wl = (a && a.week_load) || [];
+  const byEpic = VIEW === "epics" && !EPIC;
+  const h3 = document.querySelector("#chartBox2 h3");
+  if (h3) h3.innerHTML = byEpic
+    ? 'Week loading <small style="color:var(--dim);text-transform:none;letter-spacing:0">· committed hrs, stacked by epic</small>'
+    : 'Week loading <small style="color:var(--dim);text-transform:none;letter-spacing:0">· committed hrs (▓ remaining)</small>';
   if (!wl.length){ g.fillStyle = "#8b96ab"; g.font = "12px sans-serif";
     g.fillText("Commit tickets to weeks to see loading.", 12, 24); return; }
   const padL = 30, padR = 10, padT = 10, padB = 18;
@@ -464,12 +484,29 @@ function drawWeekLoad(){
   wl.forEach((w, i) => {
     const x = padL + i * bw + 6, w2 = bw - 12;
     const yTop = py(w.estimate), yBase = py(0);
-    // committed estimate (accent, or red if overloaded), remaining overlaid darker
-    g.fillStyle = w.overloaded ? "#e05252" : "#4f8cff";
-    roundRectTop(g, x, yTop, w2, yBase - yTop, 4);
-    g.fillStyle = "rgba(224,168,60,.55)";     // remaining portion
-    const yRem = py(w.remaining);
-    if (w.remaining > 0) roundRectTop(g, x, yRem, w2, yBase - yRem, 4);
+    if (byEpic){
+      // Stack the week's committed estimate as one segment per epic, in epic colors.
+      const cards = (BOARD.lanes["w" + w.week] || []).filter(t => t.status !== "cancelled");
+      const seg = {};
+      for (const t of cards) seg[t.epic_id || 0] = (seg[t.epic_id || 0] || 0) + (t.estimate_hours || 0);
+      let acc = 0;
+      const ids = Object.keys(seg).sort((a2,b2) => seg[b2] - seg[a2]);
+      for (const id of ids){
+        const y0 = py(acc), y1 = py(acc + seg[id]);
+        g.fillStyle = epicColor(id);
+        if (acc === 0 && ids.length === 1) roundRectTop(g, x, y1, w2, y0 - y1, 4);
+        else if (id === ids[ids.length - 1]) roundRectTop(g, x, y1, w2, y0 - y1, 4);
+        else { g.fillRect(x, y1, w2, y0 - y1); }
+        acc += seg[id];
+      }
+    } else {
+      // committed estimate (accent, or red if overloaded), remaining overlaid darker
+      g.fillStyle = w.overloaded ? "#e05252" : "#4f8cff";
+      roundRectTop(g, x, yTop, w2, yBase - yTop, 4);
+      g.fillStyle = "rgba(224,168,60,.55)";     // remaining portion
+      const yRem = py(w.remaining);
+      if (w.remaining > 0) roundRectTop(g, x, yRem, w2, yBase - yRem, 4);
+    }
     g.fillStyle = w.is_current ? "#e6ebf4" : "#8b96ab";
     g.textAlign = "center";
     g.fillText("W" + w.week, x + w2/2, H - 5);
@@ -641,43 +678,126 @@ function epicOrder(cards){
   return out;
 }
 
+/* The matrix: rows = epics (sticky header with effort/time-left), columns =
+   Backlog | Week 1..N | Done. A card sits at (its epic, its week). Dropping a
+   card on a cell commits it to that week AND that epic in one gesture. */
 function renderEpicBoard(board){
   const all = [];
   for (const k in BOARD.lanes) for (const t of BOARD.lanes[k]) all.push(t);
   const groups = EPICS
     .filter(e => !EPIC || String(e.id) === EPIC)
     .map(e => ({epic: e, cards: all.filter(t => t.epic_id === e.id)}));
-  const loose = EPIC ? [] : all.filter(t => !t.epic_id);
-  if (loose.length) groups.push({epic: {id: 0, name: "No epic", color: "#8b96ab"}, cards: loose});
+  const loose = all.filter(t => !t.epic_id);
+  if (!EPIC && loose.length)
+    groups.push({epic: {id: 0, name: "No epic", color: "#8b96ab"}, cards: loose});
   if (!groups.length){
     board.innerHTML = `<div class="empty" style="padding:30px">No epics yet — create one from the board, or ⇪ Import plan.</div>`;
     return;
   }
-  for (const g of groups) board.appendChild(epicLane(g.epic, g.cards));
+  const weeks = BOARD.weeks || [];
+  const cols = [{id: "backlog", label: "Backlog", sub: "unscheduled"}]
+    .concat(weeks.map(w => ({id: "w" + w.week, label: "Week " + w.week,
+                             sub: `${w.start.slice(5)}→${w.end.slice(5)}`,
+                             current: w.is_current})))
+    .concat([{id: "done", label: "Done", sub: "shipped"}]);
+
+  const mx = document.createElement("div");
+  mx.className = "matrix";
+  mx.style.gridTemplateColumns = `240px repeat(${cols.length}, 225px)`;
+
+  const corner = document.createElement("div");
+  corner.className = "mx-corner";
+  mx.appendChild(corner);
+  for (const c of cols){
+    const h = document.createElement("div");
+    h.className = "mx-col" + (c.current ? " current" : "");
+    h.innerHTML = `${c.label}${c.current ? ' <span class="d">· current</span>' : ""} <span class="d">· ${c.sub}</span>`;
+    mx.appendChild(h);
+  }
+
+  for (const g of groups){
+    mx.appendChild(epicRowHead(g.epic, g.cards));
+    for (const c of cols)
+      mx.appendChild(matrixCell(g.epic, c, g.cards.filter(t => cellLane(t) === c.id)));
+  }
+  board.appendChild(mx);
 }
 
-function epicLane(epic, cards){
+/* Which column a ticket renders in — mirrors the weeks-view lane maths. */
+function cellLane(t){
+  if (t.status === "cancelled" && !t.week_lane) return "_hidden";
+  if (isDone(t)) return "done";
+  return t.week_lane ? "w" + t.week_lane : "backlog";
+}
+
+function epicRowHead(epic, cards){
   const s = epicStats(cards);
   const el = document.createElement("div");
-  el.className = "lane epic-lane";
+  el.className = "mx-epic";
   el.style.borderTopColor = epic.color;
-  el.innerHTML = `<div class="lane-head">
-    <div class="t" style="color:${epic.color}">${escapeHtml(epic.name)}
-      <span style="color:var(--dim);font-weight:400;font-size:11px"> · ${cards.length} ticket${cards.length === 1 ? "" : "s"}</span></div>
+  el.innerHTML = `
+    <div class="t" style="font-weight:650;font-size:13px;color:${epic.color}">${escapeHtml(epic.name)}
+      <span style="color:var(--dim);font-weight:400;font-size:11px"> · ${cards.length}</span></div>
     <div class="epic-stats">
       <span><b>${fmtH(s.est)}</b> est</span>
       <span><b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>
       <span><b style="color:var(--ok)">${fmtH(s.done)}</b> done</span>
       <span style="margin-left:auto"><b>${Math.round(s.pct*100)}%</b></span>
     </div>
-    <div class="ebar"><i style="width:${Math.round(s.pct*100)}%;background:${epic.color}"></i></div>
-  </div>`;
-  const wrap = document.createElement("div"); wrap.className = "cards";
-  if (!cards.length) wrap.innerHTML = `<div class="empty">no tickets</div>`;
-  for (const {t, child} of epicOrder(cards))
-    wrap.appendChild(card(t, "epic", {color: epic.color, child}));
-  el.appendChild(wrap);
+    <div class="ebar"><i style="width:${Math.round(s.pct*100)}%;background:${epic.color}"></i></div>`;
   return el;
+}
+
+function matrixCell(epic, col, cards){
+  const el = document.createElement("div");
+  el.className = "mx-cell" + (col.current ? " current" : "");
+  const wrap = document.createElement("div"); wrap.className = "cards";
+  for (const {t, child} of epicOrder(cards))
+    wrap.appendChild(card(t, col.id, {epicView: true, color: epic.color, child}));
+  el.appendChild(wrap);
+  if (col.id !== "done"){       // Done is lifecycle-driven, not drag-driven
+    el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("dragover"); });
+    el.addEventListener("dragleave", () => el.classList.remove("dragover"));
+    el.addEventListener("drop", e => { e.preventDefault(); el.classList.remove("dragover");
+                                       onDropCell(e, epic, col.id); });
+  }
+  return el;
+}
+
+/* Drop on a matrix cell = commit to that (epic, week) in one gesture. */
+async function onDropCell(e, epic, laneId){
+  const id = parseInt(e.dataTransfer.getData("text/plain"), 10);
+  if (!id) return;
+  const t = findTicket(id);
+  if (!t) return;
+  const body = {};
+  if (laneId === "backlog"){
+    if (t.week_lane != null) body.week_lane = null;
+  } else {
+    const wk = parseInt(laneId.slice(1), 10);
+    if (t.week_lane !== wk){
+      body.week_lane = wk;
+      if (t.estimate_hours == null){
+        const est = prompt(`Estimate (hours) for ${t.ref} — required to enter a week:`);
+        if (est === null) return;
+        const v = parseFloat(est);
+        if (isNaN(v) || v < 0) return toast("Estimate must be a number of hours");
+        body.estimate_hours = v;
+      }
+    }
+  }
+  const curEpic = t.epic_id || 0;
+  try {
+    if ((epic.id || 0) !== curEpic)
+      await api("/api/tickets/" + id, {method:"PATCH",
+        body: JSON.stringify({epic_id: epic.id || 0})});
+    if (Object.keys(body).length)
+      await api("/api/roadmap/tickets/" + id, {method:"PATCH", body: JSON.stringify(body)});
+    if ((epic.id || 0) !== curEpic)
+      toast(`${t.ref} → ${epic.id ? epic.name : "no epic"}` +
+            (body.week_lane ? ` · W${body.week_lane}` : ""));
+    load();
+  } catch(err){ toast(err.message); }
 }
 
 document.getElementById("viewWeeks").addEventListener("click", () => setView("weeks"));
@@ -692,10 +812,10 @@ function setView(v){
 
 function card(t, laneId, opts){
   const done = isDone(t);
-  const epicView = laneId === "epic";
+  const epicView = !!(opts && opts.epicView);
   const el = document.createElement("div");
   el.className = "card" + (done ? " done-card" : "") + (opts?.child ? " child" : "");
-  el.draggable = !epicView && laneId !== "done" && !done;
+  el.draggable = laneId !== "done" && !done;
   el.dataset.id = t.id;
   if (epicView){
     const col = opts?.color || t.epic_color || "#8b96ab";
@@ -714,7 +834,6 @@ function card(t, laneId, opts){
     ? `<span class="pill type"${tcol ? ` style="color:${tcol};border-color:${shade(tcol,.5)}"` : ""}>${escapeHtml(t.type)}</span>` : "";
   el.innerHTML = `
     <div class="ref"><span>${t.ref}</span>${t.bump_count ? `<span class="pill bump">↻ ${t.bump_count}</span>` : ""}
-      ${epicView && t.week_lane ? `<span class="pill" title="committed to week ${t.week_lane}">W${t.week_lane}</span>` : ""}
       ${!epicView && t.epic_name ? `<span class="pill" style="background:${t.epic_color}22;color:${t.epic_color};border-color:transparent" title="Epic: ${escapeHtml(t.epic_name)}">${escapeHtml(t.epic_name)}</span>` : ""}
       <span class="grow"></span><button class="mini notes" title="notes / work log">📝</button></div>
     <div class="title">${escapeHtml(t.title)}</div>
@@ -1056,6 +1175,12 @@ function drawBurndown(){
   c.width = W * dpr; c.height = H * dpr;
   const g = c.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
   const cyc = BOARD.cycle;
+  const byEpic = VIEW === "epics" && !EPIC && ANALYTICS && ANALYTICS.epic_series
+                 && Object.keys(ANALYTICS.epic_series).length > 0;
+  const h3b = document.querySelector("#chartBox h3");
+  if (h3b) h3b.innerHTML = byEpic
+    ? 'Burndown <small style="color:var(--dim);text-transform:none;letter-spacing:0">· one line per epic (colors match the rows)</small>'
+    : 'Burndown';
   if (!cyc){ g.fillStyle = "#8b96ab"; g.fillText("Start a cycle to see the burndown.", 12, 24); return; }
 
   const day = 86400000;
@@ -1122,7 +1247,8 @@ function drawBurndown(){
       g.fillStyle = "#c069e8"; g.fillText("↻" + p.bumps, x + 2, padT + 8); g.fillStyle = "#8b96ab";
     }
   } else if (scoped){
-    // Epic-scoped: no historical series — mark current remaining + projection.
+    // Epic-scoped with no rows yet: per-epic snapshots accumulate from the day
+    // the epic first has week-lane tickets — mark current remaining + projection.
     const rem = ANALYTICS.totals.remaining, fc = ANALYTICS.forecast;
     const xNow = px(Math.min(now, x1));
     g.fillStyle = "#e0a83c"; g.beginPath(); g.arc(xNow, py(rem), 3, 0, Math.PI * 2); g.fill();
@@ -1132,7 +1258,29 @@ function drawBurndown(){
       g.moveTo(xNow, py(rem)); g.lineTo(px(tZero), py(0)); g.stroke(); g.setLineDash([]);
     }
     g.fillStyle = "#8b96ab";
-    g.fillText("epic view — history hidden (snapshots are cycle-wide)", padL + 4, padT + 10);
+    g.fillText("no history yet — this epic's burndown starts accumulating today", padL + 4, padT + 10);
+  }
+
+  // Epic view, all epics: overlay one stepped remaining-line per epic, in the
+  // epic's color (the same color as its row), so divergence is visible per epic.
+  if (byEpic){
+    for (const [id, series] of Object.entries(ANALYTICS.epic_series)){
+      if (!series.length) continue;
+      const col = epicColor(id);
+      const ep = series.map(s => ({t: new Date(s.date + "T00:00:00Z").getTime(), rem: s.remaining}));
+      g.strokeStyle = col; g.lineWidth = 1.6; g.beginPath();
+      ep.forEach((p, i) => {
+        const x = px(p.t), y = py(p.rem);
+        if (i) { g.lineTo(x, py(ep[i-1].rem)); g.lineTo(x, y); } else g.moveTo(x, y);
+      });
+      g.lineTo(px(Math.min(now, x1)), py(ep[ep.length-1].rem)); g.stroke();
+      // endpoint dot + tiny label so lines are attributable without a legend
+      const lx = px(Math.min(now, x1)), ly = py(ep[ep.length-1].rem);
+      g.fillStyle = col; g.beginPath(); g.arc(lx, ly, 2.5, 0, Math.PI * 2); g.fill();
+      const name = id === "0" || id === 0 ? "no epic"
+        : ((EPICS.find(e => e.id === +id) || {}).name || "");
+      if (name) g.fillText(name.slice(0, 14), Math.min(lx + 5, W - 60), ly - 3);
+    }
   }
 }
 
