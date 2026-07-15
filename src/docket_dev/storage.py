@@ -44,7 +44,10 @@ from docket_dev.config import CONFIG
 # Vocabulary: ticket types, priorities, statuses, and the legal transitions.
 # ---------------------------------------------------------------------------
 
-TICKET_TYPES = ("bug", "feature")
+# Work-item types. Epic is NOT a ticket type — epics are the named, color-coded
+# container entities (the `epics` table); tickets of any type belong to one via
+# `epic_id`. Hierarchy below the epic: a story groups tasks/bugs via `parent_id`.
+TICKET_TYPES = ("feature", "bug", "story", "task")
 
 # Priority scheme (provisional — Neil to confirm). P0 is most urgent; the queue
 # is ordered by priority first, then FIFO within a priority (queue_seq).
@@ -335,7 +338,8 @@ def init_db() -> None:
                          ("roadmap_status", "TEXT NOT NULL DEFAULT 'todo'"),  # backlog|todo|in_progress|done
                          ("hours_done", "REAL"),                             # actual effort logged
                          ("dev_optin", "INTEGER NOT NULL DEFAULT 0"),        # 1 = eligible for automation
-                         ("epic_id", "INTEGER")):                            # epics.id; NULL = no epic
+                         ("epic_id", "INTEGER"),                             # epics.id; NULL = no epic
+                         ("parent_id", "INTEGER")):                          # tickets.id of the parent story; NULL = top-level
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -370,6 +374,7 @@ def _row_to_ticket(row: sqlite3.Row) -> Dict[str, Any]:
     epic = epics_map().get(d.get("epic_id")) if d.get("epic_id") else None
     d["epic_name"] = epic["name"] if epic else ""
     d["epic_color"] = epic["color"] if epic else ""
+    d["parent_ref"] = ticket_ref(d["parent_id"]) if d.get("parent_id") else ""
     return d
 
 
@@ -502,11 +507,15 @@ def create_ticket(
     build_seq: Optional[int] = None,
     dev_optin: bool = False,
     epic_id: Optional[int] = None,
+    parent_id: Optional[int] = None,
+    estimate_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Raise a new ticket in the Discussion zone. Returns the created ticket.
     `build_seq` records 1-based build order (set by greenfield grooming; drives
     "Run Full Build"). `dev_optin=True` marks the ticket eligible for the automated
-    pipeline — set ONLY by explicit acts (grooming a greenfield build)."""
+    pipeline — set ONLY by explicit acts (grooming a greenfield build).
+    `parent_id` nests this ticket under a story; the child inherits the parent's
+    epic when no `epic_id` is given."""
     title = (title or "").strip()
     if not title:
         raise ValueError("title is required")
@@ -514,6 +523,17 @@ def create_ticket(
         raise ValueError(f"type must be one of {TICKET_TYPES}")
     if priority not in PRIORITIES:
         priority = DEFAULT_PRIORITY
+    if parent_id:
+        parent = get_ticket(int(parent_id))
+        if not parent:
+            raise ValueError(f"parent ticket {parent_id} not found")
+        if parent.get("parent_id"):
+            raise ValueError(f"parent {parent['ref']} is itself a child — "
+                             "only one level of nesting (story → task/bug)")
+        if epic_id is None:
+            epic_id = parent.get("epic_id")
+    if estimate_hours is not None:
+        estimate_hours = max(0.0, float(estimate_hours))
     now = utcnow_iso()
     clarity = score_clarity(title, description, acceptance_criteria, type)
 
@@ -523,12 +543,14 @@ def create_ticket(
             """INSERT INTO tickets
                (title, type, description, acceptance_criteria, clarity_score,
                 clarity_level, priority, status, created_by, seed_user_item_id,
-                build_seq, dev_optin, epic_id, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?,?)""",
+                build_seq, dev_optin, epic_id, parent_id, estimate_hours,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?,?,?,?)""",
             (title[:300], type, str(description)[:20000],
              str(acceptance_criteria)[:10000], clarity["score"], clarity["level"],
              priority, created_by, seed_user_item_id, build_seq,
-             1 if dev_optin else 0, epic_id or None, now, now),
+             1 if dev_optin else 0, epic_id or None, parent_id or None,
+             estimate_hours, now, now),
         )
         tid = cur.lastrowid
         conn.execute(
@@ -596,6 +618,7 @@ _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
     "assignee", "touched_paths", "touched_routes", "dev_optin", "epic_id",
+    "parent_id",
 }
 
 
@@ -615,6 +638,17 @@ def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
                 _invalidate_epics()          # maybe created moments ago elsewhere
                 if v not in epics_map():
                     raise ValueError(f"unknown epic {v}")
+        if k == "parent_id":
+            v = int(v) if v else None       # 0 / "" / None all unnest
+            if v is not None:
+                if v == ticket_id:
+                    raise ValueError("a ticket cannot be its own parent")
+                parent = get_ticket(v)
+                if not parent:
+                    raise ValueError(f"parent ticket {v} not found")
+                if parent.get("parent_id"):
+                    raise ValueError(f"parent {parent['ref']} is itself a child — "
+                                     "only one level of nesting (story → task/bug)")
         sets.append(f"{k}=?")
         vals.append(v)
     if not sets:

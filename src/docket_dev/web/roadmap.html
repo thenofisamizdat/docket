@@ -68,6 +68,18 @@
   #board{display:flex;gap:10px;padding:14px 20px 24px;overflow-x:auto;align-items:flex-start}
   .lane{background:var(--panel);border:1px solid var(--line);border-radius:12px;
         min-width:230px;width:230px;flex:0 0 auto;display:flex;flex-direction:column;max-height:calc(100vh - 320px)}
+  /* epic view — one lane per epic, colored, hierarchy-aware */
+  .viewtoggle{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .viewtoggle button{border:0;border-radius:0;padding:7px 12px;background:transparent}
+  .viewtoggle button.active{background:var(--accent);color:#fff}
+  #board.epics .lane{width:300px;min-width:300px}
+  .lane.epic-lane{border-top:3px solid var(--line)}
+  .epic-stats{display:flex;gap:10px;margin-top:4px;font-size:11px;color:var(--dim)}
+  .epic-stats b{color:var(--text);font-weight:650}
+  .ebar{height:5px;border-radius:4px;background:var(--bg);overflow:hidden;margin-top:7px}
+  .ebar i{display:block;height:5px;border-radius:4px}
+  .card.child{margin-left:16px;border-left-width:2px}
+  .pill.type{font-weight:650;text-transform:uppercase;letter-spacing:.4px;font-size:9.5px}
   .lane.current{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
   .lane.dragover{background:var(--panel2);border-color:var(--accent)}
   .lane-head{padding:10px 12px 8px;border-bottom:1px solid var(--line)}
@@ -189,6 +201,10 @@
 <header>
   <h1>Docket <span>Roadmap</span></h1>
   <nav class="nav"><a href="/docket">← Board</a><a href="/build">Build</a></nav>
+  <div class="viewtoggle" title="Organize the board by week lanes or by epic">
+    <button id="viewWeeks" class="active">Weeks</button>
+    <button id="viewEpics">Epics</button>
+  </div>
   <div class="cycle-info" id="cycleInfo">—</div>
   <select id="epicFilter" title="Scope the whole page — lanes, burndown, analytics — to one epic">
     <option value="">All epics</option>
@@ -198,6 +214,7 @@
   <div class="counter scope"><b id="scopeTotal">–</b><small>hrs committed</small></div>
   <div class="counter done"><b id="hoursDone">–</b><small>hrs done</small></div>
   <button id="newTicketBtn" class="primary" title="Create a new ticket">+ New ticket</button>
+  <button id="importBtn" title="Bulk import a whole plan (epics → stories → tasks/bugs) from a markdown file">⇪ Import plan</button>
   <button id="estimateBtn" title="Auto-estimate every ticket that has no estimate yet">✨ Auto-estimate</button>
   <button id="rolloverBtn" title="Bump everything unfinished in expired weeks into the current week">Roll over week</button>
   <button id="cycleBtn">New cycle…</button>
@@ -287,6 +304,7 @@
 })();
 let TOKEN = null, BOARD = null, ANALYTICS = null, TICKETS = [], EPICS = [];
 let EPIC = "";   // page-wide epic filter ("" = all) — scopes lanes, burndown, analytics
+let VIEW = localStorage.getItem("roadmap-view") === "epics" ? "epics" : "weeks";
 let PAFILTER = {type:'all', source:'all', status:'all', assignee:'all', days:'all', epic:'all'};
 
 /* ---------------- api ---------------- */
@@ -385,16 +403,21 @@ function render(){
 
   const board = document.getElementById("board");
   board.innerHTML = "";
-  board.appendChild(lane("backlog", "Backlog", "unscheduled", flt(b.lanes.backlog), false));
-  for (const w of (b.weeks || [])){
-    const cards = flt(b.lanes["w" + w.week] || []);
-    const s = laneSum(cards);
-    const bumpsIn = cards.reduce((n,c) => n + (c.bump_count ? 1 : 0), 0);
-    const sub = `${w.start.slice(5)}→${w.end.slice(5)} · ${fmtH(s.rem)} open` +
-                (bumpsIn ? ` · ↻${bumpsIn}` : "");
-    board.appendChild(lane("w" + w.week, "Week " + w.week, sub, cards, w.is_current));
+  board.classList.toggle("epics", VIEW === "epics");
+  if (VIEW === "epics"){
+    renderEpicBoard(board);
+  } else {
+    board.appendChild(lane("backlog", "Backlog", "unscheduled", flt(b.lanes.backlog), false));
+    for (const w of (b.weeks || [])){
+      const cards = flt(b.lanes["w" + w.week] || []);
+      const s = laneSum(cards);
+      const bumpsIn = cards.reduce((n,c) => n + (c.bump_count ? 1 : 0), 0);
+      const sub = `${w.start.slice(5)}→${w.end.slice(5)} · ${fmtH(s.rem)} open` +
+                  (bumpsIn ? ` · ↻${bumpsIn}` : "");
+      board.appendChild(lane("w" + w.week, "Week " + w.week, sub, cards, w.is_current));
+    }
+    board.appendChild(lane("done", "Done", fmtH(doneH) + " shipped", flt(b.lanes.done), false));
   }
-  board.appendChild(lane("done", "Done", fmtH(doneH) + " shipped", flt(b.lanes.done), false));
   drawBurndown();
   renderAnalytics();
   drawWeekLoad();
@@ -515,7 +538,7 @@ function renderProjectAnalytics(){
 
   box.innerHTML = `
     <div class="pa-filters">
-      ${sel("type",[["all","All types"],["feature","Feature"],["bug","Bug"]])}
+      ${sel("type",[["all","All types"],["feature","Feature"],["story","Story"],["task","Task"],["bug","Bug"]])}
       ${sel("source",[["all","All sources"],["automated","Automated"],["manual","Manual"]])}
       ${sel("status",[["all","Any status"],["open","Open"],["done","Done"]])}
       ${sel("epic",[["all","All epics"],["none","No epic"],
@@ -575,29 +598,132 @@ const RSTATUS = ["backlog", "todo", "in_progress", "done"];
 const RSTATUS_LABEL = {backlog:"Backlog", todo:"To Do", in_progress:"In Progress", done:"Done"};
 function isDone(t){ return t.roadmap_status === "done" || t.status === "done"; }
 
-function card(t, laneId){
-  const done = isDone(t);
+/* ---------------- epic view ---------------- */
+/* One lane per epic. The lane owns the epic's color; every card inside is a
+   shade of it — story strongest, task/feature lighter, bug lightest — so the
+   whole epic reads as one color family at a glance. */
+const TYPE_ALPHA = {story:.30, feature:.17, task:.17, bug:.09};
+function shade(hex, a){
+  const h = (hex || "#6366f1").replace("#","");
+  const n = parseInt(h.length === 3 ? h.split("").map(c => c+c).join("") : h.slice(0,6), 16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+}
+
+function epicStats(cards){
+  let est = 0, left = 0, done = 0;
+  for (const c of cards){
+    if (c.status === "cancelled") continue;
+    est += c.estimate_hours || 0;
+    done += c.hours_done || 0;
+    if (!isDone(c)) left += c.effective_remaining ?? (c.estimate_hours || 0);
+  }
+  return {est, left, done, pct: est > 0 ? Math.max(0, Math.min(1, (est - left) / est)) : 0};
+}
+
+/* Hierarchy order: each story followed by its children (indented); open work
+   before done; then parentless tasks/bugs; orphaned children fall back to
+   top-level rather than vanishing. */
+function epicOrder(cards){
+  const byId = {}, kids = {};
+  for (const c of cards) byId[c.id] = c;
+  for (const c of cards) if (c.parent_id && byId[c.parent_id])
+    (kids[c.parent_id] = kids[c.parent_id] || []).push(c);
+  const top = cards.filter(c => !(c.parent_id && byId[c.parent_id]));
+  const prio = p => ({P0:0, P1:1, P2:2, P3:3}[p] ?? 2);
+  top.sort((a,b) => (isDone(a) - isDone(b)) || ((b.type === "story") - (a.type === "story"))
+                    || (prio(a.priority) - prio(b.priority)) || (a.id - b.id));
+  const out = [];
+  for (const c of top){
+    out.push({t: c, child: false});
+    for (const k of (kids[c.id] || []).sort((a,b) => a.id - b.id))
+      out.push({t: k, child: true});
+  }
+  return out;
+}
+
+function renderEpicBoard(board){
+  const all = [];
+  for (const k in BOARD.lanes) for (const t of BOARD.lanes[k]) all.push(t);
+  const groups = EPICS
+    .filter(e => !EPIC || String(e.id) === EPIC)
+    .map(e => ({epic: e, cards: all.filter(t => t.epic_id === e.id)}));
+  const loose = EPIC ? [] : all.filter(t => !t.epic_id);
+  if (loose.length) groups.push({epic: {id: 0, name: "No epic", color: "#8b96ab"}, cards: loose});
+  if (!groups.length){
+    board.innerHTML = `<div class="empty" style="padding:30px">No epics yet — create one from the board, or ⇪ Import plan.</div>`;
+    return;
+  }
+  for (const g of groups) board.appendChild(epicLane(g.epic, g.cards));
+}
+
+function epicLane(epic, cards){
+  const s = epicStats(cards);
   const el = document.createElement("div");
-  el.className = "card" + (done ? " done-card" : "");
-  el.draggable = laneId !== "done" && !done;
+  el.className = "lane epic-lane";
+  el.style.borderTopColor = epic.color;
+  el.innerHTML = `<div class="lane-head">
+    <div class="t" style="color:${epic.color}">${escapeHtml(epic.name)}
+      <span style="color:var(--dim);font-weight:400;font-size:11px"> · ${cards.length} ticket${cards.length === 1 ? "" : "s"}</span></div>
+    <div class="epic-stats">
+      <span><b>${fmtH(s.est)}</b> est</span>
+      <span><b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>
+      <span><b style="color:var(--ok)">${fmtH(s.done)}</b> done</span>
+      <span style="margin-left:auto"><b>${Math.round(s.pct*100)}%</b></span>
+    </div>
+    <div class="ebar"><i style="width:${Math.round(s.pct*100)}%;background:${epic.color}"></i></div>
+  </div>`;
+  const wrap = document.createElement("div"); wrap.className = "cards";
+  if (!cards.length) wrap.innerHTML = `<div class="empty">no tickets</div>`;
+  for (const {t, child} of epicOrder(cards))
+    wrap.appendChild(card(t, "epic", {color: epic.color, child}));
+  el.appendChild(wrap);
+  return el;
+}
+
+document.getElementById("viewWeeks").addEventListener("click", () => setView("weeks"));
+document.getElementById("viewEpics").addEventListener("click", () => setView("epics"));
+function setView(v){
+  VIEW = v;
+  localStorage.setItem("roadmap-view", v);
+  document.getElementById("viewWeeks").classList.toggle("active", v === "weeks");
+  document.getElementById("viewEpics").classList.toggle("active", v === "epics");
+  if (BOARD) render();
+}
+
+function card(t, laneId, opts){
+  const done = isDone(t);
+  const epicView = laneId === "epic";
+  const el = document.createElement("div");
+  el.className = "card" + (done ? " done-card" : "") + (opts?.child ? " child" : "");
+  el.draggable = !epicView && laneId !== "done" && !done;
   el.dataset.id = t.id;
+  if (epicView){
+    const col = opts?.color || t.epic_color || "#8b96ab";
+    el.style.background = shade(col, TYPE_ALPHA[t.type] ?? .17);
+    el.style.borderLeft = `3px solid ${col}`;
+  }
   const est = t.estimate_hours != null
     ? `${fmtH(t.estimate_hours)}` + (done ? "" : ` · <span class="rem">${fmtH(t.effective_remaining)} left</span>`)
     : `estimate?`;
   const doneTxt = t.hours_done != null ? ` · <span class="doneh">${fmtH(t.hours_done)} done</span>` : "";
-  const opts = RSTATUS.map(s =>
+  const statusOpts = RSTATUS.map(s =>
     `<option value="${s}"${(t.roadmap_status || "todo") === s ? " selected" : ""}>${RSTATUS_LABEL[s]}</option>`).join("");
-  if (t.epic_color) el.style.borderLeft = "3px solid " + t.epic_color;
+  if (!epicView && t.epic_color) el.style.borderLeft = "3px solid " + t.epic_color;
+  const tcol = epicView ? (opts?.color || t.epic_color || "#8b96ab") : "";
+  const typePill = t.type && t.type !== "feature"
+    ? `<span class="pill type"${tcol ? ` style="color:${tcol};border-color:${shade(tcol,.5)}"` : ""}>${escapeHtml(t.type)}</span>` : "";
   el.innerHTML = `
     <div class="ref"><span>${t.ref}</span>${t.bump_count ? `<span class="pill bump">↻ ${t.bump_count}</span>` : ""}
-      ${t.epic_name ? `<span class="pill" style="background:${t.epic_color}22;color:${t.epic_color};border-color:transparent" title="Epic: ${escapeHtml(t.epic_name)}">${escapeHtml(t.epic_name)}</span>` : ""}
+      ${epicView && t.week_lane ? `<span class="pill" title="committed to week ${t.week_lane}">W${t.week_lane}</span>` : ""}
+      ${!epicView && t.epic_name ? `<span class="pill" style="background:${t.epic_color}22;color:${t.epic_color};border-color:transparent" title="Epic: ${escapeHtml(t.epic_name)}">${escapeHtml(t.epic_name)}</span>` : ""}
       <span class="grow"></span><button class="mini notes" title="notes / work log">📝</button></div>
     <div class="title">${escapeHtml(t.title)}</div>
     <div class="meta">
+      ${typePill}
       <span class="pill ${t.priority}">${t.priority}</span>
       ${["discussion","done"].includes(t.status) ? "" :
         `<span class="pill pipe-state" title="live pipeline status">🤖 ${escapeHtml(t.status_label||t.status)}</span>`}
-      <select class="rstatus" title="work status — manual, never starts the agent">${opts}</select>
+      <select class="rstatus" title="work status — manual, never starts the agent">${statusOpts}</select>
     </div>
     <div class="meta row2">
       <span class="hours" title="click to edit hours">${est}${doneTxt}</span>
@@ -812,7 +938,7 @@ function unestimatedCount(){
 document.getElementById("newTicketBtn").addEventListener("click", () => {
   openModal("New ticket", `
     <label class="fld">Title</label><input id="ntTitle" placeholder="Short, specific title">
-    <label class="fld">Type</label><select id="ntType"><option value="feature">Feature</option><option value="bug">Bug</option></select>
+    <label class="fld">Type</label><select id="ntType"><option value="feature">Feature</option><option value="story">Story</option><option value="task">Task</option><option value="bug">Bug</option></select>
     <label class="fld">Priority</label><select id="ntPriority"><option>P0</option><option>P1</option><option selected>P2</option><option>P3</option></select>
     <label class="fld">Epic</label><select id="ntEpic"><option value="">— no epic</option>` +
     EPICS.map(e => `<option value="${e.id}"${String(e.id) === EPIC ? " selected" : ""}>${escapeHtml(e.name)}</option>`).join("") + `</select>
@@ -834,6 +960,62 @@ async function createTicket(){
     closeModal(); toast(`${d.ticket.ref} created`); load();
   } catch(err){ document.getElementById("ntErr").textContent = err.message; }
 }
+/* ---------------- bulk plan import (markdown → epics/stories/tasks/bugs) ---------------- */
+document.getElementById("importBtn").addEventListener("click", () => {
+  openModal("Import a plan (markdown)", `
+    <p style="color:var(--dim);margin:0 0 6px;font-size:12.5px">
+      Paste (or upload) a roadmap document: <code>## Epic:</code> →
+      <code>### Story:</code> → <code>#### Task:</code>/<code>#### Bug:</code>,
+      with <code>Priority:</code>/<code>Estimate:</code> lines. Preview shows what
+      will be created before anything is written.</p>
+    <textarea id="impText" rows="10" style="font-family:ui-monospace,monospace;font-size:12px"
+      placeholder="## Epic: Ingestion Reliability&#10;### Story: Resumable uploads survive restarts&#10;Priority: P1&#10;Estimate: 16h&#10;..."></textarea>
+    <label class="mini" style="display:inline-block;margin-top:6px;cursor:pointer">upload .md file
+      <input type="file" id="impFile" accept=".md,.markdown,text/markdown,text/plain" style="display:none"></label>
+    <div id="impPreview" style="max-height:200px;overflow:auto;margin-top:8px;font-size:12px"></div>
+    <div class="err" id="impErr"></div>`,
+    [{label:"Cancel", cls:"", fn: closeModal},
+     {label:"Preview", cls:"", fn: () => runImport(true)},
+     {label:"Import", cls:"primary", fn: () => runImport(false)}], true);
+  document.getElementById("impFile").addEventListener("change", e => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { document.getElementById("impText").value = String(r.result); runImport(true); };
+    r.readAsText(f);
+  });
+});
+
+async function runImport(dryRun){
+  const md = document.getElementById("impText")?.value || "";
+  const errEl = document.getElementById("impErr"), prev = document.getElementById("impPreview");
+  if (!md.trim()){ errEl.textContent = "Paste or upload a markdown plan first"; return; }
+  errEl.textContent = "";
+  try {
+    const d = await api("/api/tickets/import", {method:"POST",
+      body: JSON.stringify({markdown: md, dry_run: dryRun})});
+    if (dryRun){
+      const c = d.counts || {};
+      prev.innerHTML =
+        `<div style="margin-bottom:6px"><b>${c.epics||0}</b> epic(s) · <b>${c.story||0}</b> stories · ` +
+        `<b>${c.task||0}</b> tasks · <b>${c.bug||0}</b> bugs · <b>${c.feature||0}</b> features · ` +
+        `<b>${fmtH(c.estimated_hours||0)}</b> estimated</div>` +
+        (d.warnings?.length ? `<div style="color:var(--warn);margin-bottom:6px">⚠ ${d.warnings.map(escapeHtml).join("<br>⚠ ")}</div>` : "") +
+        d.tickets.map(t =>
+          `<div style="padding:2px 0${t.parent ? ";padding-left:18px" : ""}">` +
+          `<span class="pill type" style="margin-right:6px">${escapeHtml(t.type)}</span>` +
+          `${escapeHtml(t.title)} <span style="color:var(--dim)">· ${escapeHtml(t.epic||"no epic")} · ` +
+          `${t.priority}${t.estimate_hours ? " · " + fmtH(t.estimate_hours) : ""}</span></div>`).join("");
+    } else {
+      closeModal();
+      toast(`Imported ${d.count} ticket(s) across ${d.epics.length} epic(s)` +
+            (d.errors?.length ? ` — ${d.errors.length} failed` : ""));
+      setView("epics");
+      load();
+    }
+  } catch(err){ errEl.textContent = err.message; }
+}
+
 document.getElementById("estimateBtn").addEventListener("click", async () => {
   const n = unestimatedCount();
   if (!n) return toast("Every ticket already has an estimate");

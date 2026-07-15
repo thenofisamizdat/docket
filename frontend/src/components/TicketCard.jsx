@@ -1,6 +1,14 @@
 import React from 'react'
-import { Bug, Sparkles, Activity, RefreshCw, Timer } from 'lucide-react'
+import { Bug, Sparkles, Activity, RefreshCw, Timer, BookOpen, CheckSquare } from 'lucide-react'
 import { PRIORITY_BADGE, relTime, lineProgress, fmtDuration } from '../ui.js'
+
+// One glyph per work-item type so a lane scans by shape, not just color.
+const TYPE_ICON = {
+  bug: <Bug className="w-3.5 h-3.5 text-rose-500 mt-0.5 shrink-0" />,
+  story: <BookOpen className="w-3.5 h-3.5 text-emerald-600 mt-0.5 shrink-0" />,
+  task: <CheckSquare className="w-3.5 h-3.5 text-sky-600 mt-0.5 shrink-0" />,
+  feature: <Sparkles className="w-3.5 h-3.5 text-indigo-500 mt-0.5 shrink-0" />,
+}
 
 // A single ticket card on the board. Shows the ref, type, priority, title, and
 // — the point of the whole thing — live signal: the agent's current activity,
@@ -28,10 +36,15 @@ export default function TicketCard({ ticket, onOpen }) {
       </div>
 
       <div className="flex items-start gap-1.5">
-        {ticket.type === 'bug'
-          ? <Bug className="w-3.5 h-3.5 text-rose-500 mt-0.5 shrink-0" />
-          : <Sparkles className="w-3.5 h-3.5 text-indigo-500 mt-0.5 shrink-0" />}
-        <span className="text-sm text-slate-800 leading-snug">{ticket.title}</span>
+        {TYPE_ICON[ticket.type] || TYPE_ICON.feature}
+        <span className="text-sm text-slate-800 leading-snug">
+          {ticket.parent_ref && (
+            <span className="font-mono text-[10px] text-slate-400 mr-1" title={`part of story ${ticket.parent_ref}`}>
+              ↳ {ticket.parent_ref}
+            </span>
+          )}
+          {ticket.title}
+        </span>
       </div>
 
       {ticket.status === 'queued' && ticket.position != null && (

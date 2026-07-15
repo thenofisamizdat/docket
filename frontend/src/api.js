@@ -73,6 +73,8 @@ export const api = {
   ticket: (id) => req(`/api/tickets/${id}`),
   create: (body) => req('/api/tickets', { method: 'POST', body: JSON.stringify(body) }),
   bulk: (tickets) => req('/api/tickets/bulk', { method: 'POST', body: JSON.stringify({ tickets }) }),
+  importMd: (markdown, dryRun) =>
+    req('/api/tickets/import', { method: 'POST', body: JSON.stringify({ markdown, dry_run: !!dryRun }) }),
   patch: (id, body) => req(`/api/tickets/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   epics: () => req('/api/epics'),
   createEpic: (body) => req('/api/epics', { method: 'POST', body: JSON.stringify(body) }),

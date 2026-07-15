@@ -140,6 +140,8 @@ class TicketIn(BaseModel):
     priority: str = dk.DEFAULT_PRIORITY
     seed_user_item_id: str = ""
     epic_id: Optional[int] = None
+    parent_id: Optional[int] = None            # nest under a story
+    estimate_hours: Optional[float] = None
 
 
 @router.post("")
@@ -155,6 +157,8 @@ def create_ticket(body: TicketIn, tester: dict = Depends(require_tester)):
             created_by=tester.get("name", ""),
             seed_user_item_id=body.seed_user_item_id,
             epic_id=body.epic_id,
+            parent_id=body.parent_id,
+            estimate_hours=body.estimate_hours,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -178,11 +182,43 @@ def bulk_create(body: BulkIn, tester: dict = Depends(require_tester)):
             t = dk.create_ticket(
                 title=row.title, type=row.type, description=row.description,
                 acceptance_criteria=row.acceptance_criteria, priority=row.priority,
-                created_by=tester.get("name", ""), epic_id=row.epic_id)
+                created_by=tester.get("name", ""), epic_id=row.epic_id,
+                parent_id=row.parent_id, estimate_hours=row.estimate_hours)
             created.append({"ref": t["ref"], "id": t["id"], "title": t["title"]})
         except ValueError as e:
             errors.append({"row": i + 1, "title": row.title, "error": str(e)})
     return {"created": created, "errors": errors, "count": len(created)}
+
+
+class ImportIn(BaseModel):
+    markdown: str
+    dry_run: bool = True       # default to preview; the UI confirms before writing
+
+
+@router.post("/import")
+def import_markdown(body: ImportIn, tester: dict = Depends(require_tester)):
+    """Bulk import a whole project plan from one markdown document (epics →
+    stories → tasks/bugs, with estimates). `dry_run=true` parses and reports
+    what WOULD be created; `dry_run=false` creates it. See
+    docs/GAP_ANALYSIS_TICKET_PLAYBOOK.md for the document format."""
+    from docket_dev import bulk_import
+    if not (body.markdown or "").strip():
+        raise HTTPException(status_code=400, detail="markdown document is empty")
+    plan = bulk_import.parse(body.markdown)
+    if body.dry_run:
+        return {"dry_run": True,
+                "epics": [{"name": e["name"], "color": e.get("color", "")}
+                          for e in plan["epics"]],
+                "tickets": [{"title": t["title"], "type": t["type"], "epic": t["epic"],
+                             "parent": (plan["tickets"][t["parent_idx"]]["title"]
+                                        if t.get("parent_idx") is not None else ""),
+                             "priority": t["priority"] or dk.DEFAULT_PRIORITY,
+                             "estimate_hours": t["estimate_hours"]}
+                            for t in plan["tickets"]],
+                "warnings": plan["warnings"], "counts": plan["counts"]}
+    result = bulk_import.apply(plan, created_by=tester.get("name", ""))
+    result["dry_run"] = False
+    return result
 
 
 # ---- single ticket ----
@@ -215,6 +251,7 @@ class TicketPatch(BaseModel):
     test_instructions: Optional[str] = None
     assignee: Optional[str] = None
     epic_id: Optional[int] = None   # 0 unlinks; omitted = unchanged
+    parent_id: Optional[int] = None  # 0 unnests; omitted = unchanged
 
 
 @router.patch("/{ticket_id}")
