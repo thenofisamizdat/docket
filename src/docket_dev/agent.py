@@ -68,6 +68,10 @@ DIRECT_MAIN = DEV_MODE == "direct_main"
 # because pipeline quality matters more than per-ticket cost/speed; override per
 # install via [agent].model in .docket/config.toml or DOCKET_AGENT_MODEL.
 MODEL = os.environ.get("DOCKET_AGENT_MODEL", "opus")
+# Read-only phases (assess/plan/triage/test-instructions) run a lighter model:
+# the same phase budgets buy ~5× the exploration, and SCOPE escalation upgrades
+# to STRONG_MODEL automatically when a phase genuinely needs more capability.
+LIGHT_MODEL = os.environ.get("DOCKET_AGENT_LIGHT_MODEL", "sonnet")
 # A stronger model the recovery process escalates to when the default one ran
 # out of room (SCOPE) or couldn't fix its own work (DEFECT after a corrective
 # pass). Escalation is targeted, not default — applied only by the recovery router.
@@ -134,6 +138,7 @@ RUNUSER = (_shutil.which("runuser")
            or next((p for p in ("/usr/sbin/runuser", "/sbin/runuser")
                     if os.path.exists(p)), "runuser"))
 CODEX_MODEL = os.environ.get("DOCKET_CODEX_MODEL", "gpt-5.5")
+CODEX_MAX_EST = float(os.environ.get("DOCKET_CODEX_MAX_EST", "16"))
 CODEX_ENABLED = bool(CODEX_BIN and CODEX_HOME)
 ENGINES = ("claude", "codex") if CODEX_ENABLED else ("claude",)
 # Email sender identity for msmtp-delivered notifications.
@@ -235,7 +240,8 @@ def _mark_claude_limited(text: str) -> None:
 # A SCOPE failure = the phase ran out of room (max turns / budget). The reason is
 # "too big / too hard for the resources given", so the right correction is more
 # capability — a stronger model + bigger limits — not a blind re-run.
-_SCOPE_SUBTYPES = ("error_max_turns", "error_max_budget", "error_budget_exceeded")
+_SCOPE_SUBTYPES = ("error_max_turns", "error_max_budget", "error_max_budget_usd",
+                   "error_budget_exceeded")
 _SCOPE_MARKERS = ("max turns", "maximum number of turns", "max-turns",
                   "max budget", "max-budget", "budget exceeded", "budget limit")
 
@@ -350,17 +356,30 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
     if out.get("usage_limited") and CODEX_ENABLED:
         return _codex("claude hit its usage limit — failing over to codex")
     if out["is_error"] and _is_scope(out):
-        msg = (f"{label or 'phase'} ran out of room — escalating to {STRONG_MODEL} "
-               f"with 2× turns/budget and retrying once")
+        sid = out.get("session_id", "")
+        msg = (f"{label or 'phase'} ran out of room — "
+               + ("resuming the session" if sid else "retrying once")
+               + f" on {STRONG_MODEL} with 2× turns/budget")
         log("  " + msg)
         if on_activity:
             try:
                 on_activity(msg)
             except Exception:
                 pass
-        out = run_claude(prompt, cwd, max_turns=max_turns * 2,
+        # Resuming the capped session finishes the work for a fraction of the
+        # cost of redoing it cold — everything already explored stays in context.
+        esc_prompt = (("You ran out of turns/budget before finishing. Continue from "
+                       "where you stopped and complete the task — be decisive and "
+                       "concise; do not re-explore what you already covered.")
+                      if sid else prompt)
+        out = run_claude(esc_prompt, cwd, max_turns=max_turns * 2,
                          max_budget_usd=max_budget_usd * 2, model=STRONG_MODEL,
-                         on_activity=on_activity, **kw)
+                         on_activity=on_activity, resume_session=sid, **kw)
+        if sid and out["is_error"] and not _is_scope(out):
+            # Resume itself failed (e.g. session unavailable) — one cold retry.
+            out = run_claude(prompt, cwd, max_turns=max_turns * 2,
+                             max_budget_usd=max_budget_usd * 2, model=STRONG_MODEL,
+                             on_activity=on_activity, **kw)
         out["escalated"] = True
         out.setdefault("engine", "claude")
         if out.get("usage_limited") and CODEX_ENABLED:
@@ -370,10 +389,15 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
 
 def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_tools=None,
                permission_mode="default", max_turns=20, max_budget_usd=2.0,
-               timeout=900, on_activity=None, model=None) -> dict:
+               timeout=900, on_activity=None, model=None, resume_session="") -> dict:
     """Invoke Claude Code headless in `cwd`, streaming progress. Returns
-    {text, is_error, cost, turns, session_id, subtype}."""
-    cmd = ["claude", "-p", prompt,
+    {text, is_error, cost, turns, session_id, subtype}. `resume_session`
+    continues an earlier session (used to finish budget/turn-capped phases
+    without re-spending on the exploration they already did)."""
+    cmd = ["claude", "-p"]
+    if resume_session:
+        cmd += ["--resume", resume_session]
+    cmd += [prompt,
            "--output-format", "stream-json", "--verbose",
            "--max-turns", str(max_turns),
            "--permission-mode", permission_mode,
@@ -430,6 +454,12 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
                 if out["subtype"] in _SCOPE_SUBTYPES:
                     out["is_error"] = True
                     out["text"] = out["text"] or f"ran out of room ({out['subtype']})"
+                # Error results (e.g. budget exhaustion) carry their reason in an
+                # `errors` array, not `result` — keep it, or an empty text gets
+                # clobbered by the generic "claude failed" (a TRANSIENT marker,
+                # which turns a real scope failure into a retry/requeue loop).
+                if not out["text"] and ev.get("errors"):
+                    out["text"] = "; ".join(str(e) for e in ev["errors"])[:500]
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -752,6 +782,26 @@ def _shipped_ctx() -> str:
     )
 
 
+def gate_prompt(t: dict) -> str:
+    return (
+        "You are a fast triage gate for an autonomous coding pipeline. From the "
+        "ticket text alone (do NOT explore the repository), decide whether a "
+        "coding agent can BUILD this right now:\n"
+        "- BUILD: a concrete code/config/test change an agent could implement "
+        "and verify in the repo.\n"
+        "- HUMAN: needs a person first — product/design decisions, user testing, "
+        "meetings, legal/branding/trademark/process work, professional advice, "
+        "or choosing between options the ticket leaves open.\n"
+        "Hard-but-codeable still counts as BUILD. If the parent story context "
+        "already made the decision, the child is BUILD.\n"
+        + _ctx(t) +
+        "\nReply with EXACTLY one line:\n"
+        "GATE: BUILD || <one short sentence why>\n"
+        "or\n"
+        "GATE: HUMAN || <one short sentence why>"
+    )
+
+
 def assess_prompt(t: dict) -> str:
     return (
         "You are the assessment phase of an autonomous dev pipeline working on "
@@ -1021,7 +1071,7 @@ def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "
     tr = run_phase(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
                    allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
                    permission_mode="default", max_turns=10, max_budget_usd=1.0,
-                   label="triage", on_activity=act)
+                   model=LIGHT_MODEL, label="triage", on_activity=act)
     if tr["is_error"]:
         # Couldn't even diagnose — give it another whole pass rather than stalling.
         return _recover_or_stall(tid, f"{phase} failed (triage unavailable): {failure[:160]}",
@@ -1045,9 +1095,12 @@ def choose_engine(t: dict) -> tuple[str, str]:
     """Pick the build engine for a ticket: (engine, rationale).
 
     A hand-pinned engine always wins. Otherwise route by cheap, explainable
-    heuristics: Codex takes the volume lane (small, well-specified tasks/bugs);
-    Claude keeps the judgment lane (P0s, stories, low-clarity asks, big
-    estimates, resubmits, and anything Codex already struggled on)."""
+    heuristics: Codex takes the volume lane (tasks/bugs with a workable spec —
+    claude's metered quota is the scarce resource, codex's plan is flat-rate,
+    and claude still cross-reviews everything codex builds); Claude keeps the
+    judgment lane (stories, low-clarity asks, very large estimates, resubmits,
+    and anything Codex already struggled on). Priority does NOT force claude —
+    a P0 gets its quality gate from the opus cross-review, not the builder."""
     # Only a HUMAN-pinned engine is binding — the router's own earlier stamp
     # (engine set, pinned=0) is re-evaluated every pickup, so resubmits and
     # retries can still escalate across engines.
@@ -1066,15 +1119,14 @@ def choose_engine(t: dict) -> tuple[str, str]:
         return "claude", "resubmitted work goes to the judgment lane"
     if _auto_retry_count(t["id"]) >= 2:
         return "claude", "repeated auto-retries — escalating engine"
-    if t["priority"] == "P0":
-        return "claude", "P0 — critical path stays on claude"
     if t["type"] == "story":
         return "claude", "story-sized work needs the judgment lane"
     if (t.get("clarity_level") or "") == "low":
         return "claude", "low-clarity ask needs interpretation"
     est = t.get("estimate_hours")
-    if est is not None and float(est) > 6:
-        return "claude", f"estimate {est}h is above the codex threshold (6h)"
+    if est is not None and float(est) > CODEX_MAX_EST:
+        return "claude", (f"estimate {est}h is above the codex threshold "
+                          f"({CODEX_MAX_EST:g}h)")
     return "codex", (f"small, well-specified {t['type']}"
                      + (f" (~{est}h)" if est is not None else ""))
 
@@ -1139,12 +1191,30 @@ def process_ticket(t: dict) -> None:
                      payload={"engine": engine})
         log(f"  engine → {engine}" + (f" ({route_why})" if route_why else ""))
 
-    # --- Assessment (read-only) ---
+    # --- Workability gate (cheap, BEFORE any expensive exploration): asks that
+    # need a person — decisions, process, legal, user testing — bounce to the
+    # requester without spending build-engine budget. Runs on codex (flat-rate)
+    # when available, else the light model. A gate failure is never fatal.
     dk.transition(tid, "assessment", actor="agent", summary="Picked up by the agent")
+    act("Gate: is this buildable by an agent?")
+    g = run_phase(gate_prompt(t), workdir, max_turns=1, max_budget_usd=0.3,
+                  model=LIGHT_MODEL, label="gate", on_activity=act,
+                  disallowed_tools=["Edit", "Write"],
+                  engine="codex" if CODEX_ENABLED else "claude")
+    if not g["is_error"]:
+        gv, greason = parse_verdict(g["text"], "GATE")
+        if (gv or "").strip().upper() == "HUMAN":
+            log(f"  gate → HUMAN ({(greason or '')[:80]})")
+            return _to_needs_info(t, ("This ticket needs a person, not the build "
+                                      f"agent: {greason or 'human decision/process work'}"),
+                                  phase="gate")
+
+    # --- Assessment (read-only) ---
     act("Reading the codebase to assess the request")
     a = run_phase(assess_prompt(t), workdir, allowed_tools=READONLY_TOOLS,
                   disallowed_tools=["Edit", "Write"], permission_mode="default",
-                  max_turns=15, max_budget_usd=1.5, label="assessment", on_activity=act)
+                  max_turns=15, max_budget_usd=1.5, model=LIGHT_MODEL,
+                  label="assessment", on_activity=act)
     if a["is_error"]:
         return recover(t, "assessment", a["text"], wt=workdir)
     verdict, questions = parse_verdict(a["text"], "VERDICT")
@@ -1193,7 +1263,8 @@ def process_ticket(t: dict) -> None:
     act("Drafting an implementation plan")
     p = run_phase(plan_prompt(t, a["text"]), workdir, allowed_tools=READONLY_TOOLS,
                   disallowed_tools=["Edit", "Write"], permission_mode="default",
-                  max_turns=20, max_budget_usd=1.5, label="planning", on_activity=act)
+                  max_turns=20, max_budget_usd=1.5, model=LIGHT_MODEL,
+                  label="planning", on_activity=act)
     if p["is_error"]:
         return recover(t, "planning", p["text"], wt=workdir)
     dk.add_event(tid, "plan", summary=p["text"], actor="agent",
@@ -1383,8 +1454,8 @@ def process_ticket(t: dict) -> None:
     act("Writing test instructions for the reviewer")
     ti = run_phase(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
                    disallowed_tools=["Edit", "Write"], permission_mode="default",
-                   max_turns=10, max_budget_usd=1.0, label="test instructions",
-                   on_activity=act)
+                   max_turns=10, max_budget_usd=1.0, model=LIGHT_MODEL,
+                   label="test instructions", on_activity=act)
     if not ti["is_error"] and ti["text"].strip():
         instructions = _strip_control(ti["text"])
         if not verified:
