@@ -726,6 +726,11 @@ def delete_ticket(ticket_id: int) -> bool:
     return bool(n)
 
 
+# Actor names that are machinery, not people — they never become an assignee.
+_SYSTEM_ACTORS = {"", "system", "agent", "rollover", "docket", "docket agent",
+                  "pipeline", "auto"}
+
+
 def transition(
     ticket_id: int,
     to_status: str,
@@ -766,12 +771,21 @@ def transition(
         vals: List[Any] = [to_status, now]
 
         # Entering the queue: stamp a fresh queue_seq (FIFO within a priority).
+        assigned_now = ""
         if to_status == "queued":
             nxt = conn.execute(
                 "SELECT COALESCE(MAX(queue_seq),0)+1 AS n FROM tickets"
             ).fetchone()["n"]
             sets.append("queue_seq=?")
             vals.append(nxt)
+            # An unassigned ticket defaults its assignee to the PERSON who set
+            # it in motion — they own shepherding it through review. Never
+            # overwrites a hand-picked assignee; system/agent actors don't count.
+            if (not (row["assignee"] or "").strip()
+                    and (actor or "").strip().lower() not in _SYSTEM_ACTORS):
+                sets.append("assignee=?")
+                vals.append(actor.strip())
+                assigned_now = actor.strip()
 
         # User-review bounce back into the queue = a new iteration of the ask.
         if cur_status == "user_review" and to_status in ("queued", "discussion"):
@@ -790,7 +804,8 @@ def transition(
             """INSERT INTO ticket_events (ticket_id, ts, phase, actor, kind, summary, payload)
                VALUES (?,?,?,?,?,?,?)""",
             (ticket_id, now, to_status, actor, "transition",
-             summary or f"{cur_status} → {to_status}",
+             (summary or f"{cur_status} → {to_status}")
+             + (f" · assigned to {assigned_now}" if assigned_now else ""),
              json.dumps(payload) if payload else ""),
         )
         conn.commit()

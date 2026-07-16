@@ -343,10 +343,20 @@ def send_to_pipeline(ticket_id: int, queue: bool = False,
     t = storage.get_ticket(ticket_id)
     if not t:
         raise ValueError(f"ticket {ticket_id} not found")
+    # The person handing the ticket to the pipeline becomes its default
+    # assignee (they shepherd it through review) — never overwrites a
+    # hand-picked one. The queued path also does this in transition(); this
+    # covers "make available", which is a plain field write.
+    assign = ""
+    if (not (t.get("assignee") or "").strip()
+            and (actor or "").strip().lower() not in storage._SYSTEM_ACTORS):
+        assign = actor.strip()
     conn = _connect()
     try:
         conn.execute("UPDATE tickets SET dev_optin=1, roadmap_status='in_progress', "
-                     "updated_at=? WHERE id=?", (utcnow_iso(), ticket_id))
+                     + ("assignee=?, " if assign else "")
+                     + "updated_at=? WHERE id=?",
+                     ([assign] if assign else []) + [utcnow_iso(), ticket_id])
         conn.commit()
     finally:
         conn.close()
