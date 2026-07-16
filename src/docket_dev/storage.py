@@ -688,6 +688,20 @@ def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
     return get_ticket(ticket_id)
 
 
+def delete_ticket(ticket_id: int) -> bool:
+    """Permanently delete a ticket. FK cascades remove its events, notifications,
+    and relatedness links (both directions); child tickets are unnested, never
+    deleted. Returns False if the ticket didn't exist."""
+    conn = _connect()
+    try:
+        conn.execute("UPDATE tickets SET parent_id=NULL WHERE parent_id=?", (ticket_id,))
+        n = conn.execute("DELETE FROM tickets WHERE id=?", (ticket_id,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return bool(n)
+
+
 def transition(
     ticket_id: int,
     to_status: str,

@@ -267,6 +267,21 @@ def patch_ticket(ticket_id: int, body: TicketPatch, tester: dict = Depends(requi
     return {"ticket": _detail(ticket_id)}
 
 
+@router.delete("/{ticket_id}")
+def delete_ticket(ticket_id: int, tester: dict = Depends(require_tester)):
+    """Permanently delete a ticket (history and links go with it; child tickets
+    are unnested, never deleted). Refused while the agent is actively working it."""
+    t = dk.get_ticket(ticket_id)
+    if not t:
+        raise HTTPException(status_code=404, detail=f"ticket {ticket_id} not found")
+    if t["status"] in dk.AGENT_STAGES:
+        raise HTTPException(status_code=400,
+                            detail=f"{t['ref']} is being worked by the agent "
+                                   f"({t['status']}) — stall or cancel it first")
+    dk.delete_ticket(ticket_id)
+    return {"ok": True, "ref": t["ref"], "title": t["title"]}
+
+
 # ---- lifecycle moves ----
 
 class SubmitIn(BaseModel):

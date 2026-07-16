@@ -80,7 +80,7 @@ export default function App() {
       <div className="p-8 text-slate-400">Loading…</div>
     ) : (
       <TicketDetail
-        ticketId={openId} meta={meta}
+        ticketId={openId} meta={meta} bare
         onClose={() => window.parent.postMessage('docket-ticket-close', '*')}
         onChanged={() => window.parent.postMessage('docket-ticket-changed', '*')}
       />

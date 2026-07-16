@@ -769,8 +769,11 @@ function rowHead(g){
   el.className = "mx-epic";
   el.style.borderTopColor = g.color;
   el.innerHTML = `
-    <div class="t" style="font-weight:650;font-size:13px;color:${g.color}">${escapeHtml(g.name)}
-      <span style="color:var(--dim);font-weight:400;font-size:11px"> · ${g.cards.length}</span></div>
+    <div class="t" style="font-weight:650;font-size:13px;color:${g.color};display:flex;align-items:center;gap:6px">
+      <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(g.name)}</span>
+      <span style="color:var(--dim);font-weight:400;font-size:11px">· ${g.cards.length}</span>
+      <span class="grow"></span>
+      ${g.onDelete ? `<button class="mini gdel" title="Delete this epic — its tickets are kept, they just lose the link">✕</button>` : ""}</div>
     <div class="epic-stats">
       <span><b>${fmtH(s.est)}</b> est</span>
       <span><b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>
@@ -779,6 +782,8 @@ function rowHead(g){
     </div>
     <div class="ebar"><i style="width:${Math.round(s.pct*100)}%;background:${g.color}"></i></div>` +
     (g.extra || "");
+  const del = el.querySelector(".gdel");
+  if (del) del.addEventListener("click", g.onDelete);
   return el;
 }
 
@@ -839,7 +844,8 @@ function renderEpicBoard(board){
     .filter(e => !EPIC || String(e.id) === EPIC)
     .map(e => ({name: e.name, color: e.color,
                 cards: all.filter(t => t.epic_id === e.id),
-                patch: t => (t.epic_id || 0) !== e.id ? {epic_id: e.id} : null}));
+                patch: t => (t.epic_id || 0) !== e.id ? {epic_id: e.id} : null,
+                onDelete: () => deleteEpic(e)}));
   const loose = all.filter(t => !t.epic_id);
   if (!EPIC && loose.length)
     groups.push({name: "No epic", color: "#8b96ab", cards: loose,
@@ -961,6 +967,16 @@ function drawUserWeeks(c, wl, col){
     g.fillText(w.week, x + w2/2, H - 1);
     g.textAlign = "left";
   });
+}
+
+async function deleteEpic(e){
+  if (!confirm(`Delete epic “${e.name}”?\n\nIts tickets are kept — they just lose the epic link.`)) return;
+  try {
+    await api("/api/epics/" + e.id, {method:"DELETE"});
+    if (EPIC === String(e.id)) EPIC = "";
+    toast(`Epic “${e.name}” deleted`);
+    load();
+  } catch(err){ toast(err.message); }
 }
 
 /* Quick-assign: the avatar chip on every card opens a person picker. */

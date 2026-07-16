@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import {
   X, Bug, Sparkles, ArrowRight, Activity, ClipboardCheck,
   ListChecks, MessageSquare, StickyNote, ExternalLink, RefreshCw, Check, Star,
+  BookOpen, CheckSquare, Trash2,
 } from 'lucide-react'
 import { api, getName } from '../api.js'
 import { PRIORITY_BADGE, KIND_DOT, relTime, fmtDuration } from '../ui.js'
@@ -58,7 +59,7 @@ const MOVE_LABEL = {
   'cancelled->queued': 'Reopen → Queue',
 }
 
-export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
+export default function TicketDetail({ ticketId, meta, onClose, onChanged, bare }) {
   const [t, setT] = useState(null)
   const [comment, setComment] = useState('')
   const [err, setErr] = useState('')
@@ -122,15 +123,29 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
     catch (e) { setErr(e.message) } finally { setBusy(false) }
   }
 
+  async function destroy() {
+    if (!t) return
+    if (!confirm(`Delete ${t.ref} — “${t.title}”?\n\nThis permanently removes the ticket and its history. Child tickets are kept (unnested).`)) return
+    setBusy(true); setErr('')
+    try {
+      await api.deleteTicket(ticketId)
+      onChanged && onChanged()
+      onClose && onClose()
+    } catch (e) { setErr(e.message); setBusy(false) }
+  }
+
   const meta_status = t ? (meta.status_meta[t.status] || {}) : {}
   const nextMoves = t ? (meta.transitions[t.status] || []) : []
   const effort = t ? computeEffort(t.events) : null
 
+  // Bare mode (the roadmap's embedded iframe) renders the detail as a full
+  // page filling the frame; the board keeps its right-hand drawer.
   return (
-    <div className="fixed inset-0 bg-black/30 flex justify-end z-40" onClick={onClose}>
+    <div className={bare ? 'min-h-screen bg-white' : 'fixed inset-0 bg-black/30 flex justify-end z-40'}
+         onClick={bare ? undefined : onClose}>
       <div
-        className="w-full max-w-xl bg-white h-full shadow-xl overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
+        className={bare ? 'w-full bg-white min-h-screen' : 'w-full max-w-xl bg-white h-full shadow-xl overflow-y-auto'}
+        onClick={bare ? undefined : (e) => e.stopPropagation()}
       >
         {!t ? (
           <div className="p-8 text-slate-400">{err || 'Loading…'}</div>
@@ -144,14 +159,19 @@ export default function TicketDetail({ ticketId, meta, onClose, onChanged }) {
                   <RefreshCw className="w-3 h-3" />×{t.iteration}
                 </span>)}
               <div className="flex-1" />
+              <button onClick={destroy} disabled={busy} title="Delete this ticket permanently"
+                className="text-slate-300 hover:text-rose-600 disabled:opacity-40 mr-1">
+                <Trash2 className="w-[18px] h-[18px]" />
+              </button>
               <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button>
             </div>
 
             <div className="flex flex-col md:flex-row">
               <div className="flex-1 min-w-0 p-5 space-y-4 order-2 md:order-1">
               <div className="flex items-start gap-2">
-                {t.type === 'bug'
-                  ? <Bug className="w-5 h-5 text-rose-500 mt-1 shrink-0" />
+                {t.type === 'bug' ? <Bug className="w-5 h-5 text-rose-500 mt-1 shrink-0" />
+                  : t.type === 'story' ? <BookOpen className="w-5 h-5 text-emerald-600 mt-1 shrink-0" />
+                  : t.type === 'task' ? <CheckSquare className="w-5 h-5 text-sky-600 mt-1 shrink-0" />
                   : <Sparkles className="w-5 h-5 text-indigo-500 mt-1 shrink-0" />}
                 <InlineText value={t.title} onSave={(v) => patch({ title: v })}
                   className="text-xl font-semibold text-slate-800 leading-snug" placeholder="Ticket title" />
