@@ -1044,6 +1044,23 @@ def process_ticket(t: dict) -> None:
     except subprocess.CalledProcessError as e:
         return _stall(tid, f"worktree setup failed: {e.stderr or e}")
 
+    # --- Engine routing FIRST, so the board shows the engine (and why) from
+    # the moment the ticket is picked up, not only once development starts.
+    # choose_engine needs nothing from assessment — it reads the ticket itself.
+    engine, route_why = choose_engine(t)
+    if (t.get("engine") or "") != engine:
+        try:
+            dk.update_ticket(tid, engine=engine)
+        except Exception:
+            pass
+    if CODEX_ENABLED:
+        dk.add_event(tid, "note", actor="agent",
+                     summary=f"🔀 Build engine: **{engine}**"
+                             + (f" — {route_why}" if route_why else "")
+                             + f". Review runs on **{_review_engine(engine)}**.",
+                     payload={"engine": engine})
+        log(f"  engine → {engine}" + (f" ({route_why})" if route_why else ""))
+
     # --- Assessment (read-only) ---
     dk.transition(tid, "assessment", actor="agent", summary="Picked up by the agent")
     act("Reading the codebase to assess the request")
@@ -1114,21 +1131,6 @@ def process_ticket(t: dict) -> None:
                              "implement, self-review and open a PR). Parked at Planning.")
         log(f"  writes disabled — parked {t['ref']} at Planning")
         return
-
-    # --- Engine routing: which model family builds this ticket ---
-    engine, route_why = choose_engine(t)
-    if (t.get("engine") or "") != engine:
-        try:
-            dk.update_ticket(tid, engine=engine)
-        except Exception:
-            pass
-    if CODEX_ENABLED:
-        dk.add_event(tid, "note", actor="agent",
-                     summary=f"🔀 Build engine: **{engine}**"
-                             + (f" — {route_why}" if route_why else "")
-                             + f". Review runs on **{_review_engine(engine)}**.",
-                     payload={"engine": engine})
-        log(f"  engine → {engine}" + (f" ({route_why})" if route_why else ""))
 
     # --- In Development + Self-Review: a REAL, bounded corrective loop ---
     # The agent implements, reviews its own work, and — crucially — gets up to
