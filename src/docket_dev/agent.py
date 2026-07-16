@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -421,13 +422,23 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
         return out
 
     start = time.monotonic()
+    # HARD timeout: checking the clock per line means a process that goes QUIET
+    # (hung API call, network stall) blocks readline forever and is never killed.
+    # A timer guarantees the kill; readline then sees EOF and the loop ends.
+    hung = {"killed": False}
+
+    def _hard_kill():
+        hung["killed"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _hard_kill)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         for line in proc.stdout:
-            if time.monotonic() - start > timeout:
-                proc.kill()
-                out["is_error"] = True
-                out["text"] = out["text"] or "(phase timed out)"
-                break
             line = line.strip()
             if not line:
                 continue
@@ -464,6 +475,11 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
     except subprocess.TimeoutExpired:
         proc.kill()
         out["is_error"] = True
+    finally:
+        watchdog.cancel()
+    if hung["killed"]:
+        out["is_error"] = True
+        out["text"] = out["text"] or f"(phase timed out after {timeout}s with no output)"
     if proc.returncode not in (0, None) and not out["text"]:
         out["is_error"] = True
         try:
@@ -579,13 +595,22 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
         out["text"] = f"executable not found: {e.filename or cmd[0]}"
         return out
     start = time.monotonic()
+    # HARD timeout (see the claude runner): a per-line clock check never fires
+    # if the process goes quiet — a timer guarantees the kill.
+    hung = {"killed": False}
+
+    def _hard_kill():
+        hung["killed"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(timeout, _hard_kill)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         for line in proc.stdout:
-            if time.monotonic() - start > timeout:
-                proc.kill()
-                out["is_error"] = True
-                out["text"] = out["text"] or "(phase timed out)"
-                break
             line = line.strip()
             if not line:
                 continue
@@ -620,6 +645,11 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
     except subprocess.TimeoutExpired:
         proc.kill()
         out["is_error"] = True
+    finally:
+        watchdog.cancel()
+    if hung["killed"]:
+        out["is_error"] = True
+        out["text"] = out["text"] or f"(phase timed out after {timeout}s with no output)"
     if proc.returncode not in (0, None) and not out["text"]:
         out["is_error"] = True
         try:
