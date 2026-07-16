@@ -185,8 +185,8 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
               {t.engine && (
                 <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide ${
                   t.engine === 'codex' ? 'bg-teal-50 text-teal-700' : 'bg-indigo-50 text-indigo-600'}`}
-                  title={`Build engine: ${t.engine} — see the "Build engine" note in the history for why it was chosen`}>
-                  ⚙ {t.engine}
+                  title={`Build engine: ${t.engine}${t.build_model ? ` · model: ${t.build_model}` : ''} — see the "Build engine" note in the history for why it was chosen`}>
+                  ⚙ {t.engine}{t.build_model ? ` · ${t.build_model}` : ''}
                 </span>
               )}
               <div className="flex-1" />

@@ -34,8 +34,8 @@ export default function TicketCard({ ticket, onOpen }) {
         {ticket.engine && (
           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide shrink-0 ${
             ticket.engine === 'codex' ? 'bg-teal-100 text-teal-800' : 'bg-indigo-100 text-indigo-700'}`}
-            title={`build engine: ${ticket.engine}`}>
-            ⚙ {ticket.engine}
+            title={`build engine: ${ticket.engine}${ticket.build_model ? ` · model: ${ticket.build_model}` : ''}`}>
+            ⚙ {ticket.engine}{ticket.build_model ? ` · ${ticket.build_model}` : ''}
           </span>
         )}
         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${PRIORITY_BADGE[ticket.priority] || 'bg-slate-300'}`}>

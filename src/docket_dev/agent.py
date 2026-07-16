@@ -73,6 +73,9 @@ MODEL = os.environ.get("DOCKET_AGENT_MODEL", "opus")
 # the same phase budgets buy ~5× the exploration, and SCOPE escalation upgrades
 # to STRONG_MODEL automatically when a phase genuinely needs more capability.
 LIGHT_MODEL = os.environ.get("DOCKET_AGENT_LIGHT_MODEL", "sonnet")
+# The highest claude tier — hardest builds (stories, resubmits, P0s, low-clarity,
+# big estimates) and defect-escalation passes run here for best-quality dev work.
+TOP_MODEL = os.environ.get("DOCKET_AGENT_TOP_MODEL", "fable")
 # A stronger model the recovery process escalates to when the default one ran
 # out of room (SCOPE) or couldn't fix its own work (DEFECT after a corrective
 # pass). Escalation is targeted, not default — applied only by the recovery router.
@@ -139,6 +142,11 @@ RUNUSER = (_shutil.which("runuser")
            or next((p for p in ("/usr/sbin/runuser", "/sbin/runuser")
                     if os.path.exists(p)), "runuser"))
 CODEX_MODEL = os.environ.get("DOCKET_CODEX_MODEL", "gpt-5.5")
+# Strong codex tier for hard tickets. On a ChatGPT-plan account the quality
+# lever is reasoning effort (gpt-5.6 is API-only there — verified 2026-07-16);
+# set DOCKET_CODEX_STRONG_MODEL=gpt-5.6 the moment the plan supports it.
+CODEX_STRONG_MODEL = os.environ.get("DOCKET_CODEX_STRONG_MODEL", "gpt-5.5")
+CODEX_STRONG_EFFORT = os.environ.get("DOCKET_CODEX_STRONG_EFFORT", "high")
 CODEX_MAX_EST = float(os.environ.get("DOCKET_CODEX_MAX_EST", "16"))
 CODEX_ENABLED = bool(CODEX_BIN and CODEX_HOME)
 ENGINES = ("claude", "codex") if CODEX_ENABLED else ("claude",)
@@ -319,7 +327,7 @@ def run_claude(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
 
 def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
               model=None, label: str = "", on_activity=None, engine: str = "claude",
-              **kw) -> dict:
+              codex_model=None, codex_effort: str = "", **kw) -> dict:
     """Run a pipeline phase resiliently, with SCOPE escalation. If the phase fails
     because it ran out of room (max turns / budget) — not an infra blip — retry it
     ONCE with a stronger model and doubled limits. This is the 'correct based on
@@ -342,7 +350,8 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
                 except Exception:
                     pass
         o = run_codex(prompt, cwd, on_activity=on_activity,
-                      timeout=kw.get("timeout", 900), model=None,
+                      timeout=kw.get("timeout", 900), model=codex_model,
+                      effort=codex_effort,
                       sandbox="read-only" if readonly else None)
         o.setdefault("engine", "codex")
         return o
@@ -560,7 +569,7 @@ def run_codex(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
 
 
 def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
-                    model=None, sandbox=None, **_ignored) -> dict:
+                    model=None, sandbox=None, effort="", **_ignored) -> dict:
     """Invoke Codex CLI headless in `cwd`, streaming JSONL events. Mirrors the
     claude runner's return shape: {text, is_error, cost, turns, ...}. Codex has
     no per-phase turn/budget flags — the subprocess timeout is the guardrail —
@@ -568,7 +577,11 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
     Tool policy flags (allowed/disallowed) are Claude-specific and ignored here;
     the read-only phases never run on codex."""
     out = {"text": "", "is_error": False, "cost": 0.0, "turns": 0, "session_id": "",
-           "subtype": "", "engine": "codex", "model": model or CODEX_MODEL,
+           "subtype": "",
+           "engine": "codex",
+           # Tiered label (model@effort) so per-model metrics distinguish a
+           # high-effort run from a standard one on the same base model.
+           "model": (model or CODEX_MODEL) + (f"@{effort}" if effort else ""),
            "tokens": {"input": 0, "output": 0}}
     if not CODEX_ENABLED:
         out["is_error"] = True
@@ -578,7 +591,10 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
     inner = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check",
              *(["--sandbox", sandbox] if sandbox
                else ["--dangerously-bypass-approvals-and-sandbox"]),
-             "-C", str(cwd), "-m", model or CODEX_MODEL, prompt]
+             "-C", str(cwd), "-m", model or CODEX_MODEL]
+    if effort:
+        inner += ["-c", f'model_reasoning_effort="{effort}"']
+    inner.append(prompt)
     if CODEX_USER:
         path = f"{Path(CODEX_BIN).parent}:{os.environ.get('PATH', '')}"
         cmd = [RUNUSER, "-u", CODEX_USER, "--", "env",
@@ -1161,6 +1177,37 @@ def choose_engine(t: dict) -> tuple[str, str]:
                      + (f" (~{est}h)" if est is not None else ""))
 
 
+def _is_hard(t: dict) -> tuple[bool, str]:
+    """Does this ticket warrant the top model tier of whichever engine builds it?"""
+    if t["type"] == "story":
+        return True, "story-sized"
+    if int(t.get("iteration") or 0) >= 1:
+        return True, "resubmit"
+    if (t.get("clarity_level") or "") == "low":
+        return True, "low-clarity"
+    if t["priority"] == "P0":
+        return True, "P0"
+    est = t.get("estimate_hours")
+    if est is not None and float(est) > 8:
+        return True, f"large (~{est:g}h)"
+    return False, ""
+
+
+def choose_build_model(t: dict, engine: str) -> tuple[str, str, str]:
+    """Second routing axis: within the chosen engine, pick the model TIER that
+    does the best-quality development work for this ticket. Returns
+    (model, effort, why) — effort applies only to codex, whose quality lever on
+    a ChatGPT plan is reasoning effort rather than a bigger model."""
+    hard, why = _is_hard(t)
+    if engine == "codex":
+        if hard and (CODEX_STRONG_MODEL != CODEX_MODEL or CODEX_STRONG_EFFORT):
+            return CODEX_STRONG_MODEL, CODEX_STRONG_EFFORT, f"{why} → strong codex tier"
+        return CODEX_MODEL, "", "standard codex tier"
+    if hard:
+        return TOP_MODEL, "", f"{why} → top claude tier"
+    return MODEL, "", "standard claude tier"
+
+
 def _review_engine(build_engine: str) -> str:
     """Cross-engine review: the reviewer should not share the builder's blind
     spots, so run it on the opposite engine whenever one is available."""
@@ -1208,18 +1255,21 @@ def process_ticket(t: dict) -> None:
     # the moment the ticket is picked up, not only once development starts.
     # choose_engine needs nothing from assessment — it reads the ticket itself.
     engine, route_why = choose_engine(t)
-    if (t.get("engine") or "") != engine:
-        try:
-            dk.update_ticket(tid, engine=engine)
-        except Exception:
-            pass
+    build_model, build_effort, model_why = choose_build_model(t, engine)
+    build_model_label = build_model + (f"@{build_effort}" if build_effort else "")
+    try:
+        dk.update_ticket(tid, engine=engine, build_model=build_model_label)
+    except Exception:
+        pass
     if CODEX_ENABLED:
         dk.add_event(tid, "note", actor="agent",
-                     summary=f"🔀 Build engine: **{engine}**"
+                     summary=f"🔀 Build engine: **{engine} / {build_model_label}**"
                              + (f" — {route_why}" if route_why else "")
+                             + (f"; {model_why}" if model_why else "")
                              + f". Review runs on **{_review_engine(engine)}**.",
-                     payload={"engine": engine})
-        log(f"  engine → {engine}" + (f" ({route_why})" if route_why else ""))
+                     payload={"engine": engine, "model": build_model_label})
+        log(f"  engine → {engine}/{build_model_label}"
+            + (f" ({route_why or model_why})" if (route_why or model_why) else ""))
 
     # --- Workability gate (cheap, BEFORE any expensive exploration): asks that
     # need a person — decisions, process, legal, user testing — bounce to the
@@ -1345,7 +1395,11 @@ def process_ticket(t: dict) -> None:
         # we start escalated immediately rather than re-earning the bug.
         escalated_pass = attempt >= 2 or iteration >= 1
         pass_engine = "claude" if (engine == "codex" and escalated_pass) else engine
-        pass_model = STRONG_MODEL if (escalated_pass and pass_engine == "claude") else None
+        if pass_engine == "claude":
+            pass_model = (TOP_MODEL if escalated_pass
+                          else (build_model if engine == "claude" else MODEL))
+        else:
+            pass_model = build_model
         if attempt == 1:
             act(f"Implementing the change ({pass_engine})")
             impl_prompt = implement_prompt(t, p["text"])
@@ -1356,12 +1410,14 @@ def process_ticket(t: dict) -> None:
         if pass_engine != engine:
             dk.add_event(tid, "note", actor="agent",
                          summary=f"🔀 Engine escalation: corrective pass {attempt} runs on "
-                                 f"**claude** ({STRONG_MODEL}) after codex couldn't clear review.",
-                         payload={"engine": pass_engine})
+                                 f"**claude** ({TOP_MODEL}) after codex couldn't clear review.",
+                         payload={"engine": pass_engine, "model": TOP_MODEL})
         i = run_phase(impl_prompt, wt, allowed_tools=WRITE_TOOLS,
                       permission_mode="acceptEdits", max_turns=40, max_budget_usd=5.0,
                       model=pass_model, label="implementation", on_activity=act,
-                      engine=pass_engine)
+                      engine=pass_engine,
+                      codex_model=(build_model if pass_engine == "codex" else None),
+                      codex_effort=(build_effort if pass_engine == "codex" else ""))
         if i["is_error"]:
             return recover(t, "implementation", i["text"], wt=wt)
         label = "**Implemented**" if attempt == 1 else f"**Revised (pass {attempt})**"

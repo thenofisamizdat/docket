@@ -365,7 +365,8 @@ def init_db() -> None:
                          ("epic_id", "INTEGER"),                             # epics.id; NULL = no epic
                          ("parent_id", "INTEGER"),                           # tickets.id of the parent story; NULL = top-level
                          ("engine", "TEXT NOT NULL DEFAULT ''"),             # build engine: ''=auto | claude | codex
-                         ("engine_pinned", "INTEGER NOT NULL DEFAULT 0")):   # 1 = a human chose it; router respects it
+                         ("engine_pinned", "INTEGER NOT NULL DEFAULT 0"),    # 1 = a human chose it; router respects it
+                         ("build_model", "TEXT NOT NULL DEFAULT ''")):       # routed model tier, e.g. opus | fable | gpt-5.5@high
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -644,7 +645,7 @@ _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
     "assignee", "touched_paths", "touched_routes", "dev_optin", "epic_id",
-    "parent_id", "engine", "engine_pinned",
+    "parent_id", "engine", "engine_pinned", "build_model",
 }
 
 ENGINES = ("", "claude", "codex")   # '' = auto (the agent's router decides)
