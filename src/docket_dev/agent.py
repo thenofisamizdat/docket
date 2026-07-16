@@ -148,6 +148,25 @@ CODEX_MODEL = os.environ.get("DOCKET_CODEX_MODEL", "gpt-5.5")
 CODEX_STRONG_MODEL = os.environ.get("DOCKET_CODEX_STRONG_MODEL", "gpt-5.5")
 CODEX_STRONG_EFFORT = os.environ.get("DOCKET_CODEX_STRONG_EFFORT", "high")
 CODEX_MAX_EST = float(os.environ.get("DOCKET_CODEX_MAX_EST", "16"))
+# Quota-aware routing: below LOW an engine is treated as nearly-out and the
+# router spills its lane to the other engine; below FLOOR on BOTH, the loop
+# holds pickups entirely rather than manufacturing failures.
+QUOTA_LOW_PCT = float(os.environ.get("DOCKET_QUOTA_LOW_PCT", "15"))
+QUOTA_FLOOR_PCT = float(os.environ.get("DOCKET_QUOTA_FLOOR_PCT", "3"))
+
+
+def _engine_headroom() -> tuple[float | None, float | None]:
+    """(claude_available_pct, codex_available_pct) from the shared quota feed —
+    None per side on any error (routing then falls back to the static rules)."""
+    try:
+        from docket_dev import quota
+        q = quota.get_quota()
+        c = (q.get("claude") or {}).get("available_pct")
+        x = (q.get("codex") or {}).get("available_pct")
+        return (float(c) if c is not None else None,
+                float(x) if x is not None else None)
+    except Exception:
+        return None, None
 CODEX_ENABLED = bool(CODEX_BIN and CODEX_HOME)
 ENGINES = ("claude", "codex") if CODEX_ENABLED else ("claude",)
 # Email sender identity for msmtp-delivered notifications.
@@ -1161,6 +1180,16 @@ def choose_engine(t: dict) -> tuple[str, str]:
         return "claude", ""
     if _claude_limited():
         return "codex", "claude is usage-limited — codex takes the queue"
+    # Quota balancing: spill a nearly-out engine's lane to the other BEFORE the
+    # wall is hit — this outranks even the judgment-lane rules, because quality
+    # routing to an engine with no budget just produces expensive failures.
+    c_left, x_left = _engine_headroom()
+    if (c_left is not None and c_left <= QUOTA_LOW_PCT
+            and (x_left is None or x_left > QUOTA_LOW_PCT)):
+        return "codex", f"claude quota nearly exhausted ({c_left:g}% left) — codex takes it"
+    if (x_left is not None and x_left <= QUOTA_LOW_PCT
+            and (c_left is None or c_left > QUOTA_LOW_PCT)):
+        return "claude", f"codex quota nearly exhausted ({x_left:g}% left) — claude takes it"
     if int(t.get("iteration") or 0) >= 1:
         return "claude", "resubmitted work goes to the judgment lane"
     if _auto_retry_count(t["id"]) >= 2:
@@ -2120,7 +2149,17 @@ def main() -> int:
             reconcile_merged_prs()
             auto_deploy_tick()
             drain_notifications()
-            if ctl != "running" or not run_once():
+            # Both engines effectively out of quota → hold pickups (quota feed
+            # is cached 60s; a side that errors reads as None = not exhausted).
+            c_left, x_left = _engine_headroom()
+            starved = (c_left is not None and c_left <= QUOTA_FLOOR_PCT
+                       and (x_left is not None and x_left <= QUOTA_FLOOR_PCT
+                            if CODEX_ENABLED else True))
+            if starved != getattr(main, "_starved", False):
+                main._starved = starved
+                log("both engines out of quota — holding pickups until a window resets"
+                    if starved else "quota recovered — resuming pickups")
+            if ctl != "running" or starved or not run_once():
                 time.sleep(POLL_SECS)
         except KeyboardInterrupt:
             log("stopping")
