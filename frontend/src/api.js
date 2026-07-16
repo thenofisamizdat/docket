@@ -91,6 +91,8 @@ export const api = {
     req(`/api/tickets/${id}/transition`, { method: 'POST', body: JSON.stringify({ to_status, summary: summary || '' }) }),
   resubmit: (id, body) =>
     req(`/api/tickets/${id}/resubmit`, { method: 'POST', body: JSON.stringify(body) }),
+  answer: (id, text) =>
+    req(`/api/tickets/${id}/answer`, { method: 'POST', body: JSON.stringify({ text }) }),
   comment: (id, text) =>
     req(`/api/tickets/${id}/comment`, { method: 'POST', body: JSON.stringify({ text }) }),
 

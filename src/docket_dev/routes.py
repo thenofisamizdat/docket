@@ -570,6 +570,34 @@ class CommentIn(BaseModel):
     text: str
 
 
+class AnswerIn(BaseModel):
+    text: str
+
+
+@router.post("/{ticket_id}/answer")
+def answer_ticket(ticket_id: int, body: AnswerIn, tester: dict = Depends(require_tester)):
+    """Record the requester's answer to a waiting ticket and move it on in ONE
+    action: decision tickets (human_only) close as done — which automatically
+    unblocks their story's implementation siblings — while ordinary bounced
+    tickets go back to the queue for the agent to act on the answer."""
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(422, "answer text is required")
+    t = dk.get_ticket(ticket_id)
+    if not t:
+        raise HTTPException(404, "ticket not found")
+    who = tester.get("name") or tester.get("username") or "tester"
+    dk.add_event(ticket_id, "comment", actor=who,
+                 summary=f"📌 Answer: {text}")
+    if t.get("human_only"):
+        out = dk.transition(ticket_id, "done", actor=who,
+                            summary="Decision answered and closed — sibling work unblocked")
+    else:
+        out = dk.transition(ticket_id, "queued", actor=who,
+                            summary="Answered — requeued for the agent")
+    return {"ticket": out}
+
+
 @router.post("/{ticket_id}/comment")
 def add_comment(ticket_id: int, body: CommentIn, tester: dict = Depends(require_tester)):
     """Append a comment to the ticket's timeline."""

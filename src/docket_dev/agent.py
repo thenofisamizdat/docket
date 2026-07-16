@@ -748,7 +748,7 @@ def _ctx(t: dict) -> str:
             f"TITLE: {t['title']}\n"
             f"DESCRIPTION: {t.get('description') or '(none)'}\n"
             f"ACCEPTANCE CRITERIA: {t.get('acceptance_criteria') or '(none)'}\n")
-    return base + _hierarchy_ctx(t) + _prior_rejections_ctx(t)
+    return base + _hierarchy_ctx(t) + _answers_ctx(t) + _prior_rejections_ctx(t)
 
 
 def _hierarchy_ctx(t: dict) -> str:
@@ -782,6 +782,36 @@ def _hierarchy_ctx(t: dict) -> str:
         out = ("\nPLAN HIERARCHY CONTEXT — scope and design decisions often live here; "
                "consult it (and the codebase) BEFORE bouncing for clarification:\n" + out)
     return out
+
+
+def _answers_ctx(t: dict) -> str:
+    """Human comments/answers the agent must act on. Two sources: (1) comments
+    on THIS ticket — when the agent bounces a question, the requester's answer
+    comes back as a comment, and without this section the agent literally never
+    read it; (2) answers recorded on the story's CLOSED decision siblings — the
+    input this implementation ticket was deferred for."""
+    out = ""
+    try:
+        human = [e for e in dk.get_events(t["id"])
+                 if e.get("kind") == "comment"
+                 and (e.get("actor") or "") not in ("agent", "system")]
+        if human:
+            out += "COMMENTS / ANSWERS FROM PEOPLE (oldest first — act on these):\n"
+            for e in human[-5:]:
+                out += f"- {e.get('actor')}: {(e.get('summary') or '')[:800]}\n"
+        if t.get("parent_id"):
+            for s in dk.children_of(t["parent_id"]):
+                if (s["id"] != t["id"] and s.get("human_only")
+                        and s["status"] in ("done", "cancelled")):
+                    sev = [e for e in dk.get_events(s["id"])
+                           if e.get("kind") == "comment"
+                           and (e.get("actor") or "") not in ("agent",)]
+                    if sev:
+                        out += (f"DECISION {s['ref']} ({s['title'][:60]}) — RECORDED "
+                                f"ANSWER: {(sev[-1].get('summary') or '')[:1000]}\n")
+    except Exception:
+        pass
+    return ("\n" + out) if out else ""
 
 
 def _prior_rejections_ctx(t: dict) -> str:

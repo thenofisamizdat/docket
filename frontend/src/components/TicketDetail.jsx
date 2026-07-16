@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import {
   X, Bug, Sparkles, ArrowRight, Activity, ClipboardCheck,
   ListChecks, MessageSquare, StickyNote, ExternalLink, RefreshCw, Check, Star,
-  BookOpen, CheckSquare, Trash2,
+  BookOpen, CheckSquare, Trash2, Maximize2, Minimize2, HelpCircle,
 } from 'lucide-react'
 import { api, getName } from '../api.js'
 import { PRIORITY_BADGE, KIND_DOT, relTime, fmtDuration } from '../ui.js'
@@ -71,6 +71,8 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
   const [amending, setAmending] = useState(false)
   const [testers, setTesters] = useState([])
   const [epics, setEpics] = useState([])
+  const [maxi, setMaxi] = useState(false)
+  const [answer, setAnswer] = useState('')
 
   useEffect(() => {
     api.epics().then((r) => setEpics(r.epics || [])).catch(() => {})
@@ -149,7 +151,8 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
     <div className={bare ? 'min-h-screen bg-white' : 'fixed inset-0 bg-black/30 flex justify-end z-40'}
          onClick={bare ? undefined : onClose}>
       <div
-        className={bare ? 'w-full bg-white min-h-screen' : 'w-full max-w-xl bg-white h-full shadow-xl overflow-y-auto'}
+        className={bare ? 'w-full bg-white min-h-screen'
+          : `w-full ${maxi ? 'max-w-[96vw]' : 'max-w-xl'} bg-white h-full shadow-xl overflow-y-auto transition-[max-width] duration-200`}
         onClick={bare ? undefined : (e) => e.stopPropagation()}
       >
         {!t ? (
@@ -200,8 +203,56 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                 className="text-slate-300 hover:text-rose-600 disabled:opacity-40 mr-1">
                 <Trash2 className="w-[18px] h-[18px]" />
               </button>
+              {!bare && (
+                <button onClick={() => setMaxi((m) => !m)} title={maxi ? 'Restore side panel' : 'Maximize'}
+                  className="text-slate-400 hover:text-slate-600 mr-1">
+                  {maxi ? <Minimize2 className="w-[18px] h-[18px]" /> : <Maximize2 className="w-[18px] h-[18px]" />}
+                </button>
+              )}
               <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="w-5 h-5" /></button>
             </div>
+
+            {/* Waiting-on-you banner: the ticket is blocked on a human answer.
+                Shows THE question prominently and lets the answer + requeue/close
+                happen in one action — no digging through the timeline. */}
+            {(t.status === 'needs_info' || (!!t.human_only && ['queued', 'discussion'].includes(t.status))) && (() => {
+              const bounces = (t.events || []).filter((e) => (e.summary || '').startsWith('Needs clarification:'))
+              const q = bounces.length
+                ? bounces[bounces.length - 1].summary.replace(/^Needs clarification:\s*/, '')
+                : (t.human_only ? 'This is a decision ticket — record your decision below to unblock the dependent work.' : '')
+              const submit = async () => {
+                if (!answer.trim() || busy) return
+                setBusy(true); setErr('')
+                try {
+                  await api.answer(t.id, answer.trim())
+                  setAnswer('')
+                  await load()
+                  onChanged && onChanged()
+                } catch (e) { setErr(e.message) } finally { setBusy(false) }
+              }
+              return (
+                <div className="mx-5 mt-4 p-4 rounded-xl border-2 border-amber-300 bg-amber-50">
+                  <div className="flex items-start gap-2">
+                    <HelpCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-amber-900">
+                        {t.human_only ? 'Decision needed — this ticket is waiting on you' : 'Waiting on your input'}
+                      </div>
+                      <div className="text-sm text-amber-900/90 mt-1 whitespace-pre-wrap">{q}</div>
+                    </div>
+                  </div>
+                  <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} rows={3}
+                    placeholder={t.human_only ? 'Record the decision…' : 'Type the answer…'}
+                    className="mt-3 w-full text-sm border border-amber-300 rounded-lg p-2 bg-white focus:outline-none focus:ring-2 focus:ring-amber-300" />
+                  <div className="mt-2 flex justify-end">
+                    <button onClick={submit} disabled={busy || !answer.trim()}
+                      className="px-3 py-1.5 rounded-lg text-sm font-medium text-white disabled:opacity-40 bg-amber-600 hover:bg-amber-700">
+                      {t.human_only ? '✓ Record decision & close (unblocks siblings)' : '↺ Answer & requeue'}
+                    </button>
+                  </div>
+                </div>
+              )
+            })()}
 
             <div className="flex flex-col md:flex-row">
               <div className="flex-1 min-w-0 p-5 space-y-4 order-2 md:order-1">

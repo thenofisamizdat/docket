@@ -93,8 +93,8 @@ AGENT_STAGES = ("assessment", "planning", "in_development", "self_review")
 # self-review retry loop, the user-review fail->requeue loop, and the
 # needs-info / stalled recovery paths are all encoded here.
 TRANSITIONS: Dict[str, set] = {
-    "discussion":        {"queued", "cancelled"},
-    "queued":            {"assessment", "discussion", "cancelled", "stalled"},
+    "discussion":        {"queued", "cancelled", "done"},
+    "queued":            {"assessment", "discussion", "cancelled", "stalled", "done"},
     # "queued" is reachable from every agent stage so the agent can AUTO-REQUEUE a
     # ticket after a transient/infra failure (self-healing) instead of stranding
     # it in Stalled — see agent._recover_or_stall. "needs_info" from self_review
@@ -110,7 +110,9 @@ TRANSITIONS: Dict[str, set] = {
     "user_review":       {"done", "queued", "discussion", "cancelled"},
     # Recovery paths: a bounced/stalled ticket re-enters the pipeline or returns
     # to discussion for amendment.
-    "needs_info":        {"queued", "assessment", "planning", "in_development", "discussion", "cancelled"},
+    # "done" from the human-gate/queue lanes exists for DECISION tickets: a
+    # person records the answer and closes them without any agent involvement.
+    "needs_info":        {"queued", "assessment", "planning", "in_development", "discussion", "cancelled", "done"},
     "stalled":           {"queued", "assessment", "planning", "in_development", "needs_info", "cancelled"},
     "done":              {"queued"},  # reopen
     # "Won't Do" — a human dismisses an ask (e.g. redundant/out-of-scope). Allowed
