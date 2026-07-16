@@ -939,11 +939,20 @@ def _stall(tid: int, why: str, *, transient: bool = False) -> None:
 
 
 def _auto_retry_count(tid: int) -> int:
-    """How many times this ticket has already been auto-requeued for a transient
-    failure (counted from the timeline so it survives agent restarts)."""
+    """How many times this ticket has been auto-requeued for a transient failure
+    since a person (or the system) last set it in motion — counted from the
+    timeline so it survives agent restarts. A non-agent requeue RESETS the
+    budget: a deliberate requeue shouldn't inherit a recovery cap spent in an
+    earlier incident (e.g. a whole-queue churn during a usage-limit outage)."""
     try:
-        return sum(1 for e in dk.get_events(tid)
-                   if e.get("actor") == "agent" and AUTO_RETRY_MARK in (e.get("summary") or ""))
+        n = 0
+        for e in dk.get_events(tid):
+            if (e.get("kind") == "transition" and e.get("phase") == "queued"
+                    and (e.get("actor") or "") != "agent"):
+                n = 0
+            elif e.get("actor") == "agent" and AUTO_RETRY_MARK in (e.get("summary") or ""):
+                n += 1
+        return n
     except Exception:
         return 0
 
