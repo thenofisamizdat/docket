@@ -31,6 +31,12 @@ export default function TicketCard({ ticket, onOpen }) {
           </span>
         )}
         <span className="flex-1" />
+        {!!ticket.human_only && (
+          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 bg-purple-100 text-purple-700"
+            title="Decision ticket — a person answers it; the agent never builds it, and its story's implementation children wait for the answer.">
+            🧭 decision
+          </span>
+        )}
         {ticket.engine && (
           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide shrink-0 ${
             ticket.engine === 'codex' ? 'bg-teal-100 text-teal-800' : 'bg-indigo-100 text-indigo-700'}`}

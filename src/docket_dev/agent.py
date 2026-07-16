@@ -2113,16 +2113,27 @@ def reconcile_merged_prs() -> None:
             log(f"  merge reconcile skipped DKT-{tid}: {e}")
 
 
+_deferred_logged: set = set()
+
+
 def run_once() -> bool:
-    """Work the single highest-priority queued ticket. Returns True if one ran."""
-    t = dk.next_in_queue()
-    if not t:
-        return False
-    try:
-        process_ticket(t)
-    except Exception as e:
-        _stall(t["id"], f"unexpected error: {e}")
-    return True
+    """Work the highest-priority PICKABLE queued ticket. Human-owned decision
+    tickets and children of unanswered decisions stay queued untouched (logged
+    once per reason) — answering the decision unblocks them automatically."""
+    for t in dk.queue():
+        why = dk.pickup_block_reason(t)
+        if why:
+            key = (t["id"], why[:40])
+            if key not in _deferred_logged:
+                log(f"DKT-{t['id']} left in queue — {why}")
+                _deferred_logged.add(key)
+            continue
+        try:
+            process_ticket(t)
+        except Exception as e:
+            _stall(t["id"], f"unexpected error: {e}")
+        return True
+    return False
 
 
 def main() -> int:

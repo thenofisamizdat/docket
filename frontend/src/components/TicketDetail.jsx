@@ -182,6 +182,12 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                 <span className="flex items-center gap-0.5 text-[11px] text-slate-500" title="re-submitted">
                   <RefreshCw className="w-3 h-3" />×{t.iteration}
                 </span>)}
+              {!!t.human_only && (
+                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-50 text-purple-700"
+                  title="Decision ticket — a person answers it; the agent never builds it, and sibling implementation tickets wait for the answer.">
+                  🧭 decision
+                </span>
+              )}
               {t.engine && (
                 <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide ${
                   t.engine === 'codex' ? 'bg-teal-50 text-teal-700' : 'bg-indigo-50 text-indigo-600'}`}
@@ -387,6 +393,12 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                         ...(meta.engines || ['claude']).map((e) => ({ value: e, label: e }))]} />
                   </Field>
                 )}
+                <Field label="Owner">
+                  <InlineSelect value={t.human_only ? '1' : '0'}
+                    onSave={(v) => patch({ human_only: Number(v) })}
+                    options={[{ value: '0', label: 'agent (buildable)' },
+                      { value: '1', label: '🧭 human (decision)' }]} />
+                </Field>
                 <Field label="Epic">
                   <div className="flex items-center gap-1.5">
                     {t.epic_color && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: t.epic_color }} />}

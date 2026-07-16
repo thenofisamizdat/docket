@@ -48,6 +48,22 @@ Epic  →  Story  →  Task / Bug
 - **Bug** — something that exists but is broken. Same nesting rules as Task.
 - **Feature** — allowed at `###` level for small standalone additions that
   don't warrant a story; prefer Story + Tasks for anything bigger than a day.
+- **Decision** — an open question a PERSON must answer before sibling work can
+  proceed: product/design choices, contract definitions, approvals, naming,
+  user testing, legal/branding clearance. Use a `#### Decision:` heading under
+  the story. Decision tickets import **human-owned**: the build agent never
+  picks them up, and every implementation sibling in the same story is
+  automatically held in the queue until the decision ticket is closed. This
+  matters — a gap analysis naturally produces "decide X, then build against X"
+  pairs, and typing the first half as a Task sends an unanswerable question
+  into the automated pipeline.
+
+  **Phrasing rule:** if a Task/Feature title *starts with* Define, Confirm,
+  Choose, Decide, Select, Approve, or User-test, the importer treats it as a
+  Decision anyway (with a dry-run warning). If the item is genuinely buildable,
+  rephrase it with an implementation verb ("Implement the approved section
+  order" not "Approve and implement the section order" — and put the approval
+  in its own `#### Decision:`).
 
 Only ONE level of nesting is supported below a story: a `####` item cannot
 have children of its own. If a task feels like it needs subtasks, it's a

@@ -35,8 +35,14 @@ from typing import Any, Dict, List, Optional
 from docket_dev import storage
 
 _HEADING = re.compile(
-    r"^(#{2,4})\s*(epic|story|task|bug|feature)\s*[:\-–—]\s*(.+?)\s*$",
+    r"^(#{2,4})\s*(epic|story|task|bug|feature|decision)\s*[:\-–—]\s*(.+?)\s*$",
     re.IGNORECASE)
+# Titles that READ as a decision even without the explicit `### Decision:` type.
+# A leading decision verb means the ticket's output is an answer, not a diff —
+# the agent can't build it, so import it human-owned rather than letting it
+# churn through (and bounce out of) the automated pipeline.
+_DECISION_VERBS = re.compile(
+    r"^(define|confirm|choose|decide|select|approve|user-test)\b", re.IGNORECASE)
 _META = re.compile(
     r"^\**\s*(priority|estimate|color)\s*:?\**\s*:?\s*(.+?)\s*$",
     re.IGNORECASE)
@@ -104,11 +110,17 @@ def parse(markdown: str) -> Dict[str, Any]:
                     parent_idx = cur_story_idx
             if cur_epic is None:
                 warnings.append(f"line {ln_no}: '{kind}: {title}' appears before any '## Epic:' — imported without an epic")
+            # `### Decision:` imports as a human-owned task: its output is an
+            # answer from a person, not a diff — the agent never picks it up,
+            # and its story's implementation children wait for it.
+            human_only = kind == "decision"
+            if human_only:
+                kind = "task"
             cur = {"title": title, "type": kind, "epic": cur_epic,
                    "parent_idx": parent_idx, "priority": "", "estimate_hours": None,
-                   "_desc": [], "_ac": []}
+                   "human_only": human_only, "_desc": [], "_ac": []}
             tickets.append(cur)
-            if level <= 3:
+            if level <= 3 and not human_only:
                 cur_story_idx = len(tickets) - 1
             continue
 
@@ -148,6 +160,19 @@ def parse(markdown: str) -> Dict[str, Any]:
 
     close_section()
 
+    # Decision-shaped titles that weren't explicitly typed: a leading decision
+    # verb means a person must answer this — flag it human-owned and say so in
+    # the dry-run preview so the author can rephrase if it IS buildable.
+    for t in tickets:
+        if (not t.get("human_only") and t["type"] in ("task", "feature")
+                and _DECISION_VERBS.match(t["title"])):
+            t["human_only"] = True
+            warnings.append(
+                f"'{t['title'][:70]}': reads as a DECISION (leading verb) — imported "
+                "human-owned; the agent will not build it and its story's children "
+                "wait for its answer. Rephrase with an implementation verb (or use "
+                "'### Task:') if an agent should build it.")
+
     for t in tickets:
         if not t["estimate_hours"]:
             # Stories summing their children is fine; anything else unestimated is worth flagging.
@@ -159,6 +184,7 @@ def parse(markdown: str) -> Dict[str, Any]:
               "estimated_hours": round(sum(t["estimate_hours"] or 0 for t in tickets), 1)}
     for kind in storage.TICKET_TYPES:
         counts[kind] = sum(1 for t in tickets if t["type"] == kind)
+    counts["decisions"] = sum(1 for t in tickets if t.get("human_only"))
     return {"epics": epics, "tickets": tickets, "warnings": warnings, "counts": counts}
 
 
@@ -365,6 +391,7 @@ def apply(plan: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
                 epic_id=epic_ids.get((t.get("epic") or "").lower()),
                 parent_id=parent_id,
                 estimate_hours=t.get("estimate_hours"),
+                human_only=bool(t.get("human_only")),
             )
             idx_to_id[i] = made["id"]
             created.append({"ref": made["ref"], "id": made["id"], "title": made["title"],

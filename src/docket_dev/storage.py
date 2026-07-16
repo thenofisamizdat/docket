@@ -366,7 +366,8 @@ def init_db() -> None:
                          ("parent_id", "INTEGER"),                           # tickets.id of the parent story; NULL = top-level
                          ("engine", "TEXT NOT NULL DEFAULT ''"),             # build engine: ''=auto | claude | codex
                          ("engine_pinned", "INTEGER NOT NULL DEFAULT 0"),    # 1 = a human chose it; router respects it
-                         ("build_model", "TEXT NOT NULL DEFAULT ''")):       # routed model tier, e.g. opus | fable | gpt-5.5@high
+                         ("build_model", "TEXT NOT NULL DEFAULT ''"),        # routed model tier, e.g. opus | fable | gpt-5.5@high
+                         ("human_only", "INTEGER NOT NULL DEFAULT 0")):      # 🧭 decision ticket: a person answers it; the agent never builds it
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         # Small operator-facing switches (e.g. the pipeline play/pause/stop
@@ -542,6 +543,7 @@ def create_ticket(
     epic_id: Optional[int] = None,
     parent_id: Optional[int] = None,
     estimate_hours: Optional[float] = None,
+    human_only: bool = False,
 ) -> Dict[str, Any]:
     """Raise a new ticket in the Discussion zone. Returns the created ticket.
     `build_seq` records 1-based build order (set by greenfield grooming; drives
@@ -577,13 +579,13 @@ def create_ticket(
                (title, type, description, acceptance_criteria, clarity_score,
                 clarity_level, priority, status, created_by, seed_user_item_id,
                 build_seq, dev_optin, epic_id, parent_id, estimate_hours,
-                created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?,?,?,?)""",
+                human_only, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'discussion',?,?,?,?,?,?,?,?,?,?)""",
             (title[:300], type, str(description)[:20000],
              str(acceptance_criteria)[:10000], clarity["score"], clarity["level"],
              priority, created_by, seed_user_item_id, build_seq,
              1 if dev_optin else 0, epic_id or None, parent_id or None,
-             estimate_hours, now, now),
+             estimate_hours, 1 if human_only else 0, now, now),
         )
         tid = cur.lastrowid
         conn.execute(
@@ -670,7 +672,7 @@ _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
     "assignee", "touched_paths", "touched_routes", "dev_optin", "epic_id",
-    "parent_id", "engine", "engine_pinned", "build_model",
+    "parent_id", "engine", "engine_pinned", "build_model", "human_only",
 }
 
 ENGINES = ("", "claude", "codex")   # '' = auto (the agent's router decides)
@@ -936,10 +938,43 @@ def queue() -> List[Dict[str, Any]]:
         conn.close()
 
 
+def pickup_block_reason(t: Dict[str, Any]) -> str:
+    """Why the agent should NOT pick this queued ticket right now ('' = pickable).
+
+    Two rules: (1) human-owned decision tickets are never built by the agent —
+    a person answers them; (2) an implementation child is deferred while any
+    decision sibling in the same story is unresolved, because that decision IS
+    the missing input (building ahead of it is guesswork). Deliberately NOT
+    keyed on needs_info siblings — bounced siblings must not block each other
+    once the decision lands."""
+    if t.get("human_only"):
+        return "human-owned decision ticket — a person answers it, the agent never builds it"
+    pid = t.get("parent_id")
+    if not pid:
+        return ""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT id, title FROM tickets
+               WHERE parent_id=? AND id != ? AND human_only=1
+                 AND status NOT IN ('done','cancelled')""",
+            (pid, t["id"])).fetchall()
+    finally:
+        conn.close()
+    if rows:
+        r = rows[0]
+        return (f"deferred until decision DKT-{r['id']} is answered "
+                f"({r['title'][:70]})")
+    return ""
+
+
 def next_in_queue() -> Optional[Dict[str, Any]]:
-    """The ticket the orchestrator should pick up next (highest priority, oldest)."""
-    q = queue()
-    return q[0] if q else None
+    """The ticket the orchestrator should pick up next (highest priority, oldest),
+    skipping tickets pickup_block_reason() holds back."""
+    for t in queue():
+        if not pickup_block_reason(t):
+            return t
+    return None
 
 
 def requeue_stuck_agent_tickets() -> List[Dict[str, Any]]:
