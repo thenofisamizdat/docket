@@ -1070,7 +1070,7 @@ def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "
     act("Diagnosing the failure to choose the right recovery")
     tr = run_phase(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
                    allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
-                   permission_mode="default", max_turns=10, max_budget_usd=1.0,
+                   permission_mode="default", max_turns=20, max_budget_usd=1.0,
                    model=LIGHT_MODEL, label="triage", on_activity=act)
     if tr["is_error"]:
         # Couldn't even diagnose — give it another whole pass rather than stalling.
@@ -1211,9 +1211,12 @@ def process_ticket(t: dict) -> None:
 
     # --- Assessment (read-only) ---
     act("Reading the codebase to assess the request")
+    # Turn caps are sized for LIGHT_MODEL: lighter models take more, cheaper
+    # turns than opus, so opus-era ceilings made them escalate straight back to
+    # the expensive model. The budget cap is the real cost guard.
     a = run_phase(assess_prompt(t), workdir, allowed_tools=READONLY_TOOLS,
                   disallowed_tools=["Edit", "Write"], permission_mode="default",
-                  max_turns=15, max_budget_usd=1.5, model=LIGHT_MODEL,
+                  max_turns=30, max_budget_usd=1.5, model=LIGHT_MODEL,
                   label="assessment", on_activity=act)
     if a["is_error"]:
         return recover(t, "assessment", a["text"], wt=workdir)
@@ -1263,7 +1266,7 @@ def process_ticket(t: dict) -> None:
     act("Drafting an implementation plan")
     p = run_phase(plan_prompt(t, a["text"]), workdir, allowed_tools=READONLY_TOOLS,
                   disallowed_tools=["Edit", "Write"], permission_mode="default",
-                  max_turns=20, max_budget_usd=1.5, model=LIGHT_MODEL,
+                  max_turns=40, max_budget_usd=1.5, model=LIGHT_MODEL,
                   label="planning", on_activity=act)
     if p["is_error"]:
         return recover(t, "planning", p["text"], wt=workdir)
@@ -1454,7 +1457,7 @@ def process_ticket(t: dict) -> None:
     act("Writing test instructions for the reviewer")
     ti = run_phase(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
                    disallowed_tools=["Edit", "Write"], permission_mode="default",
-                   max_turns=10, max_budget_usd=1.0, model=LIGHT_MODEL,
+                   max_turns=20, max_budget_usd=1.0, model=LIGHT_MODEL,
                    label="test instructions", on_activity=act)
     if not ti["is_error"] and ti["text"].strip():
         instructions = _strip_control(ti["text"])
