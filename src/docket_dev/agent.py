@@ -128,6 +128,11 @@ def _discover_codex() -> tuple[str, str, str]:
 
 
 CODEX_BIN, CODEX_HOME, CODEX_USER = _discover_codex()
+# runuser lives in /usr/sbin, which the systemd unit PATH omits — resolve it to
+# an absolute path or every codex Popen dies with FileNotFoundError.
+RUNUSER = (_shutil.which("runuser")
+           or next((p for p in ("/usr/sbin/runuser", "/sbin/runuser")
+                    if os.path.exists(p)), "runuser"))
 CODEX_MODEL = os.environ.get("DOCKET_CODEX_MODEL", "gpt-5.5")
 CODEX_ENABLED = bool(CODEX_BIN and CODEX_HOME)
 ENGINES = ("claude", "codex") if CODEX_ENABLED else ("claude",)
@@ -469,7 +474,7 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
              "-C", str(cwd), "-m", model or CODEX_MODEL, prompt]
     if CODEX_USER:
         path = f"{Path(CODEX_BIN).parent}:{os.environ.get('PATH', '')}"
-        cmd = ["runuser", "-u", CODEX_USER, "--", "env",
+        cmd = [RUNUSER, "-u", CODEX_USER, "--", "env",
                f"CODEX_HOME={CODEX_HOME}", f"PATH={path}", *inner]
     else:
         cmd = inner
@@ -478,9 +483,9 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
-    except FileNotFoundError:
+    except FileNotFoundError as e:
         out["is_error"] = True
-        out["text"] = "codex CLI not found"
+        out["text"] = f"executable not found: {e.filename or cmd[0]}"
         return out
     start = time.monotonic()
     try:
