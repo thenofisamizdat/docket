@@ -344,7 +344,7 @@
   q.delete("sso"); q.delete("name");
   history.replaceState(null, "", location.pathname + (q.toString() ? "?" + q.toString() : "") + location.hash);
 })();
-let TOKEN = null, BOARD = null, ANALYTICS = null, TICKETS = [], EPICS = [], USERS = null;
+let TOKEN = null, BOARD = null, ANALYTICS = null, TICKETS = [], EPICS = [], USERS = null, MODELS = [];
 let EPIC = "";   // page-wide epic filter ("" = all) — scopes lanes, burndown, analytics
 let VIEW = ["epics","people"].includes(localStorage.getItem("roadmap-view"))
   ? localStorage.getItem("roadmap-view") : "weeks";
@@ -396,7 +396,8 @@ document.getElementById("loginForm").addEventListener("submit", async e => {
 async function load(){
   try { BOARD = await api("/api/roadmap"); } catch(e){ return; }
   try { ANALYTICS = await api("/api/roadmap/analytics" + (EPIC ? "?epic_id=" + EPIC : "")); } catch(e){ ANALYTICS = null; }
-  try { TICKETS = (await api("/api/tickets/analytics")).tickets || []; } catch(e){ TICKETS = []; }
+  try { const td = await api("/api/tickets/analytics"); TICKETS = td.tickets || []; MODELS = td.models || []; }
+  catch(e){ TICKETS = []; MODELS = []; }
   try { EPICS = (await api("/api/epics")).epics || []; } catch(e){ EPICS = []; }
   try { USERS = await api("/api/roadmap/users"); } catch(e){ USERS = null; }
   renderEpicFilter();
@@ -653,11 +654,74 @@ function renderProjectAnalytics(){
       <div class="pa-card"><h4>By type</h4>${groupBars(byType)}
         <h4 style="margin-top:12px">By assignee</h4>${groupBars(byAss)}
       </div>
-    </div>`;
+    </div>
+    ${enginePanel(rows)}`;
   box.querySelectorAll(".pa-filters select").forEach(s => s.addEventListener("change", () => {
     PAFILTER[s.dataset.f] = s.value;
     renderProjectAnalytics();
   }));
+}
+
+/* Engine & model scoreboard — who's performing best, what's costing most.
+   Engine columns respect the panel filters (rows are pre-filtered); the model
+   table is a run-level rollup from event payloads (server-side). */
+const ENGINE_COLOR = {claude: "#4f8cff", codex: "#14b8a6"};
+function enginePanel(rows){
+  const engs = ["claude", "codex"].filter(en => rows.some(r => r.engine === en));
+  const eAgg = en => {
+    const rs = rows.filter(r => r.engine === en);
+    const done = rs.filter(paDone);
+    const cyc = done.map(r => r.cycle_secs).filter(x => x != null);
+    const grades = rs.map(r => r.grade).filter(x => x != null);
+    const vr = rs.filter(r => r.verified != null);
+    return {
+      n: rs.length, done: done.length,
+      avgCycle: cyc.length ? cyc.reduce((a,b) => a+b, 0) / cyc.length : null,
+      agentSecs: rs.reduce((s,r) => s + (r.agent_secs || 0), 0),
+      cost: rs.reduce((s,r) => s + (r.cost_usd || 0), 0),
+      resubPct: rs.length ? Math.round(rs.filter(r => r.iteration > 0).length / rs.length * 100) : 0,
+      stalls: rs.reduce((s,r) => s + (r.stalls || 0), 0),
+      grade: grades.length ? (grades.reduce((a,b) => a+b, 0) / grades.length).toFixed(1) : null,
+      graded: grades.length,
+      verifiedPct: vr.length ? Math.round(rs.filter(r => r.verified === true).length / vr.length * 100) : null,
+    };
+  };
+  const engTable = !engs.length
+    ? `<div class="empty" style="color:var(--dim);font-size:12px;text-align:left">No engine-routed tickets in this slice yet — the router stamps an engine when the agent picks a ticket up.</div>`
+    : (() => {
+        const A = engs.map(eAgg);
+        const hdr = engs.map(en => `<div class="h" style="color:${ENGINE_COLOR[en]}">${en}</div>`).join("");
+        const row = (lbl, fn) => `<div class="r lbl">${lbl}</div>` +
+          A.map(a => `<div class="r val">${fn(a)}</div>`).join("");
+        return `<div class="cmp" style="grid-template-columns:1.4fr repeat(${engs.length},1fr)">
+          <div class="h"></div>${hdr}
+          ${row("Tickets", a => a.n)}
+          ${row("Done", a => a.done)}
+          ${row("Avg cycle", a => fmtDur(a.avgCycle))}
+          ${row("Agent time", a => fmtHrs(a.agentSecs))}
+          ${row("API cost", a => "$" + a.cost.toFixed(2))}
+          ${row("Resubmits", a => a.resubPct + "%")}
+          ${row("Stalls", a => a.stalls)}
+          ${row("Build grade", a => a.grade != null ? `${a.grade}/10 <span style="color:var(--dim);font-weight:400">(${a.graded})</span>` : "–")}
+          ${row("Verified", a => a.verifiedPct != null ? a.verifiedPct + "%" : "–")}
+        </div>`;
+      })();
+  const fmtTok = n => n >= 1e6 ? (n/1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n/1e3) + "k" : String(n);
+  const modelRows = (MODELS || []).map(m => `
+    <tr><td style="color:${ENGINE_COLOR[m.engine] || "var(--text)"}">${escapeHtml(m.engine)}${m.model ? " · " + escapeHtml(m.model) : ""}</td>
+      <td>${m.runs}</td><td>${m.tickets}</td><td>${fmtHrs(m.secs)}</td>
+      <td>${m.cost_usd ? "$" + m.cost_usd.toFixed(2) : "–"}</td>
+      <td>${(m.tokens_in || m.tokens_out) ? fmtTok(m.tokens_in) + " / " + fmtTok(m.tokens_out) : "–"}</td></tr>`).join("");
+  const modelTable = modelRows
+    ? `<table style="width:100%;font-size:12px;border-collapse:collapse;font-variant-numeric:tabular-nums">
+        <thead><tr style="color:var(--dim);font-size:10px;text-transform:uppercase;text-align:left">
+          <th style="padding:3px 0">Engine · model</th><th>Runs</th><th>Tickets</th><th>Time</th><th>API cost</th><th>Tokens in/out</th></tr></thead>
+        <tbody>${modelRows.replace(/<td/g, '<td style="padding:4px 8px 4px 0;border-top:1px solid var(--line)"')}</tbody></table>`
+    : `<div class="empty" style="color:var(--dim);font-size:12px;text-align:left">No per-model run data yet.</div>`;
+  return `<div class="pa-card" style="margin-top:0"><h4>Engine performance <small style="color:var(--dim);text-transform:none;letter-spacing:0">· follows the filters above · codex cost is plan-based (tokens shown instead)</small></h4>
+    ${engTable}
+    <h4 style="margin-top:14px">By model <small style="color:var(--dim);text-transform:none;letter-spacing:0">· every agent run, all phases</small></h4>
+    ${modelTable}</div>`;
 }
 
 document.getElementById("analyticsToggle").addEventListener("click", () => {

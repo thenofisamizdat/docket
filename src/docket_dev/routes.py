@@ -505,6 +505,35 @@ def rate_impact(ticket_id: int, body: ImpactIn, tester: dict = Depends(require_t
     return {"event": ev}
 
 
+class GradeIn(BaseModel):
+    score: int             # 0 (unusable) … 10 (flawless build)
+    note: str = ""
+
+
+@router.post("/{ticket_id}/grade")
+def grade_build(ticket_id: int, body: GradeIn, tester: dict = Depends(require_tester)):
+    """Tester's 0-10 grade of the BUILD quality, given at user review (or on a
+    done ticket). Distinct from post-ship impact: grade = how well the agent
+    executed the ask; impact = how much the shipped thing mattered. One grade
+    per tester per ticket — regrading replaces your earlier one. The grade is
+    tagged with the ticket's engine so per-engine/model scoreboards can use it."""
+    if not 0 <= body.score <= 10:
+        raise HTTPException(status_code=400, detail="score must be 0-10")
+    t = dk.get_ticket(ticket_id)
+    if not t:
+        raise HTTPException(status_code=404, detail=f"ticket {ticket_id} not found")
+    if t["status"] not in ("user_review", "done"):
+        raise HTTPException(status_code=400,
+                            detail="grade a build at user review (or once it's done)")
+    note = body.note.strip()[:500]
+    ev = dk.add_event(
+        ticket_id, "grade", actor=tester.get("name", ""),
+        summary=f"Graded the build {body.score}/10" + (f" — {note}" if note else ""),
+        payload={"score": body.score, "note": note, "engine": t.get("engine") or ""},
+    )
+    return {"event": ev}
+
+
 class CommentIn(BaseModel):
     text: str
 

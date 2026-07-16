@@ -182,6 +182,13 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                 <span className="flex items-center gap-0.5 text-[11px] text-slate-500" title="re-submitted">
                   <RefreshCw className="w-3 h-3" />×{t.iteration}
                 </span>)}
+              {t.engine && (
+                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide ${
+                  t.engine === 'codex' ? 'bg-teal-50 text-teal-700' : 'bg-indigo-50 text-indigo-600'}`}
+                  title={`Build engine: ${t.engine} — see the "Build engine" note in the history for why it was chosen`}>
+                  ⚙ {t.engine}
+                </span>
+              )}
               <div className="flex-1" />
               <button onClick={destroy} disabled={busy} title="Delete this ticket permanently"
                 className="text-slate-300 hover:text-rose-600 disabled:opacity-40 mr-1">
@@ -259,6 +266,15 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                       <X className="w-4 h-4" /> Needs more — send back
                     </button>
                   </div>
+                  <GradeRow t={t} onGraded={load} />
+                </div>
+              )}
+
+              {/* A done ticket can (re)grade the build too — the score still
+                  counts toward the engine/model scoreboard. */}
+              {t.status === 'done' && (
+                <div className="rounded-xl border border-slate-200 p-3">
+                  <GradeRow t={t} onGraded={load} />
                 </div>
               )}
 
@@ -615,6 +631,58 @@ function RelatedPanel({ t, onChanged }) {
 // "How's this working out?" — 1-5 stars + optional note on a Done ticket.
 // Latest rating per tester wins; the profile maths aggregates them into the
 // creator's "shipped impact" dimension.
+// 0-10 build-quality grade, given at user review (regradeable on done).
+// Distinct from impact: grade = how well the agent executed; impact = how much
+// the shipped thing mattered. Feeds the per-engine/per-model scoreboard.
+function GradeRow({ t, onGraded }) {
+  const me = (getName() || '').trim().toLowerCase()
+  const latest = {}
+  for (const ev of t.events || []) {
+    if (ev.kind === 'grade' && ev.payload && typeof ev.payload === 'object' && ev.payload.score != null) {
+      latest[(ev.actor || '').trim().toLowerCase()] = ev.payload.score
+    }
+  }
+  const mine = latest[me]
+  const all = Object.values(latest)
+  const avg = all.length ? (all.reduce((a, b) => a + b, 0) / all.length).toFixed(1) : null
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+
+  async function grade(n) {
+    setBusy(true); setErr('')
+    try { await api.grade(t.id, n); onGraded && onGraded() }
+    catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t border-emerald-100/80">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-xs font-medium text-slate-600 mr-1">
+          Grade this build{t.engine ? ` (${t.engine})` : ''}:
+        </span>
+        {Array.from({ length: 11 }, (_, n) => (
+          <button key={n} disabled={busy} onClick={() => grade(n)}
+            title={`${n}/10`}
+            className={`w-6 h-6 rounded text-[11px] font-semibold border transition ${
+              mine === n
+                ? 'bg-indigo-600 border-indigo-600 text-white'
+                : 'bg-white border-slate-200 text-slate-500 hover:border-indigo-400 hover:text-indigo-600'
+            } disabled:opacity-50`}>
+            {n}
+          </button>
+        ))}
+        {avg != null && (
+          <span className="text-[11px] text-slate-500 ml-1">
+            avg <b>{avg}</b>/10{all.length > 1 ? ` · ${all.length} graders` : ''}
+          </span>
+        )}
+      </div>
+      {err && <div className="text-xs text-rose-600 mt-1">{err}</div>}
+    </div>
+  )
+}
+
+
 function ImpactPanel({ t, onRated }) {
   const me = (getName() || '').trim().toLowerCase()
   const latest = {} // rater(normalised) -> {rating, note}

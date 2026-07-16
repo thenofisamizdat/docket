@@ -120,9 +120,10 @@ TRANSITIONS: Dict[str, set] = {
 }
 
 # ticket_events.kind — what a timeline entry represents. 'impact' is a
-# post-ship rating (1-5 + note) left on a Done ticket; latest per rater wins.
+# post-ship rating (1-5 + note) left on a Done ticket; 'grade' is the tester's
+# 0-10 score of the BUILD quality given at user review. Latest per rater wins.
 EVENT_KINDS = ("transition", "activity", "assessment", "plan", "comment", "note",
-               "impact")
+               "impact", "grade")
 
 VALID_NOTIFY_EVENTS = ("needs_info", "pr_ready", "user_review", "stalled", "failed")
 
@@ -1144,6 +1145,12 @@ def analytics() -> Dict[str, Any]:
     # this client-side (any slice or side-by-side is instant, no endpoint per filter). ----
     agg = _dd(lambda: {"secs": 0.0, "cost": 0.0, "turns": 0})
     notes_by = _dd(list)
+    stalls_by = _dd(int)                       # transitions into Stalled per ticket
+    grades_by = _dd(dict)                      # ticket -> {rater: latest 0-10 score}
+    # Per-(engine, model) run rollup — every agent run event carries its engine
+    # + model since v0.13, so the scoreboard can compare families AND versions.
+    model_agg = _dd(lambda: {"runs": 0, "secs": 0.0, "cost": 0.0, "turns": 0,
+                             "tokens_in": 0, "tokens_out": 0, "tickets": set()})
     for e in evs:
         p = _pl(e)
         if p:
@@ -1151,8 +1158,26 @@ def analytics() -> Dict[str, Any]:
             a["secs"] += float(p.get("duration_secs") or 0)
             a["cost"] += float(p.get("cost_usd") or 0)
             a["turns"] += int(p.get("turns") or 0)
+            if p.get("duration_secs") and (p.get("engine") or p.get("model")):
+                m = model_agg[(p.get("engine") or "claude", p.get("model") or "")]
+                m["runs"] += 1
+                m["secs"] += float(p.get("duration_secs") or 0)
+                m["cost"] += float(p.get("cost_usd") or 0)
+                m["turns"] += int(p.get("turns") or 0)
+                tok = p.get("tokens") or {}
+                m["tokens_in"] += int(tok.get("input") or 0)
+                m["tokens_out"] += int(tok.get("output") or 0)
+                m["tickets"].add(e["ticket_id"])
+            if e["kind"] == "grade" and p.get("score") is not None:
+                grades_by[e["ticket_id"]][e.get("actor") or "?"] = float(p["score"])
+        if e["kind"] == "transition" and e.get("phase") == "stalled":
+            stalls_by[e["ticket_id"]] += 1
         if e["kind"] == "note":
             notes_by[e["ticket_id"]].append(str(e.get("summary") or ""))
+
+    def _grade(tid):
+        g = grades_by.get(tid)
+        return round(sum(g.values()) / len(g), 1) if g else None
 
     def _verified(tid):
         blob = " ".join(notes_by.get(tid, []))
@@ -1184,6 +1209,8 @@ def analytics() -> Dict[str, Any]:
             "agent_secs": round(a["secs"]), "cost_usd": round(a["cost"], 4), "turns": a["turns"],
             "is_automated": a["secs"] > 0,      # the agent ran on it (has run-events)
             "engine": t.get("engine") or "",    # build engine ('' until routed)
+            "stalls": stalls_by.get(tid, 0),    # times it fell into Stalled
+            "grade": _grade(tid),               # avg tester build-grade (0-10)
             "hours_done": t.get("hours_done"), "estimate_hours": t.get("estimate_hours"),
             "roadmap_status": t.get("roadmap_status"), "week_lane": t.get("week_lane"),
             "iteration": int(t.get("iteration") or 0),
@@ -1191,8 +1218,17 @@ def analytics() -> Dict[str, Any]:
             "verified": _verified(tid),
         })
 
+    models = sorted(
+        [{"engine": k[0], "model": k[1], "runs": v["runs"],
+          "secs": round(v["secs"]), "cost_usd": round(v["cost"], 2),
+          "turns": v["turns"], "tokens_in": v["tokens_in"],
+          "tokens_out": v["tokens_out"], "tickets": len(v["tickets"])}
+         for k, v in model_agg.items()],
+        key=lambda m: -m["secs"])
+
     return {
         "tickets": ticket_rows,
+        "models": models,
         "totals": {"total": total, "done": done, "open": total - done, "by_status": by_status},
         "effort": {"total_cost_usd": round(cost, 2), "total_secs": round(secs),
                    "tickets_with_effort": len(eff_tickets),

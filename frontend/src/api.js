@@ -97,6 +97,8 @@ export const api = {
   profiles: () => req('/api/tickets/profiles'),
   impact: (id, body) =>
     req(`/api/tickets/${id}/impact`, { method: 'POST', body: JSON.stringify(body) }),
+  grade: (id, score, note) =>
+    req(`/api/tickets/${id}/grade`, { method: 'POST', body: JSON.stringify({ score, note: note || '' }) }),
   resolveLink: (id, linkId, action) =>
     req(`/api/tickets/${id}/links/${linkId}/resolve`, { method: 'POST', body: JSON.stringify({ action }) }),
 

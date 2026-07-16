@@ -321,7 +321,7 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
         cmd += ["--disallowedTools", *disallowed_tools]
 
     out = {"text": "", "is_error": False, "cost": 0.0, "turns": 0, "session_id": "",
-           "subtype": ""}
+           "subtype": "", "engine": "claude", "model": model or MODEL}
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -457,7 +457,7 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
     Tool policy flags (allowed/disallowed) are Claude-specific and ignored here;
     the read-only phases never run on codex."""
     out = {"text": "", "is_error": False, "cost": 0.0, "turns": 0, "session_id": "",
-           "subtype": "", "engine": "codex",
+           "subtype": "", "engine": "codex", "model": model or CODEX_MODEL,
            "tokens": {"input": 0, "output": 0}}
     if not CODEX_ENABLED:
         out["is_error"] = True
@@ -1018,7 +1018,8 @@ def process_ticket(t: dict) -> None:
         return recover(t, "assessment", a["text"], wt=workdir)
     verdict, questions = parse_verdict(a["text"], "VERDICT")
     dk.add_event(tid, "assessment", summary=_strip_control(a["text"]), actor="agent",
-                 payload={"cost_usd": a["cost"], "turns": a["turns"], "duration_secs": a["duration"]})
+                 payload={"cost_usd": a["cost"], "turns": a["turns"], "duration_secs": a["duration"],
+                          "engine": a.get("engine", "claude"), "model": a.get("model", "")})
     log(f"  assessment done (verdict={verdict or 'PROCEED'}, ${a['cost']:.3f}, {a['turns']} turns)")
 
     # Follow-up detection: the agent explored the codebase, so its RELATED call
@@ -1065,7 +1066,8 @@ def process_ticket(t: dict) -> None:
     if p["is_error"]:
         return recover(t, "planning", p["text"], wt=workdir)
     dk.add_event(tid, "plan", summary=p["text"], actor="agent",
-                 payload={"cost_usd": p["cost"], "turns": p["turns"], "duration_secs": p["duration"]})
+                 payload={"cost_usd": p["cost"], "turns": p["turns"], "duration_secs": p["duration"],
+                          "engine": p.get("engine", "claude"), "model": p.get("model", "")})
     log(f"  plan done (${p['cost']:.3f}, {p['turns']} turns)")
 
     if not WRITES_ENABLED:
@@ -1146,6 +1148,7 @@ def process_ticket(t: dict) -> None:
         dk.add_event(tid, "note", summary=f"{label}\n\n" + i["text"][:1500], actor="agent",
                      payload={"cost_usd": i["cost"], "turns": i["turns"],
                               "duration_secs": i["duration"], "engine": i.get("engine", pass_engine),
+                              "model": i.get("model", ""),
                               **({"tokens": i["tokens"]} if i.get("tokens") else {})})
         # Commit anything this pass produced.
         _git(wt, ["add", "-A"])
@@ -1204,6 +1207,7 @@ def process_ticket(t: dict) -> None:
                      actor="agent", payload={"cost_usd": r["cost"], "turns": r["turns"],
                                              "duration_secs": r["duration"],
                                              "engine": r.get("engine", rev_engine),
+                                             "model": r.get("model", ""),
                                              **({"tokens": r["tokens"]} if r.get("tokens") else {})})
         rv, fix = parse_verdict(r["text"], "REVIEW")
         if rv == "PASS":
