@@ -688,6 +688,22 @@ def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
     return get_ticket(ticket_id)
 
 
+def children_of(ticket_id: int) -> List[Dict[str, Any]]:
+    """Light summaries of the tickets nested under a story (for the detail
+    view's breakdown list)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM tickets WHERE parent_id=? ORDER BY id", (ticket_id,)
+        ).fetchall()
+        kids = [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
+    return [{k: t.get(k) for k in ("id", "ref", "title", "type", "status",
+                                   "status_label", "priority", "estimate_hours")}
+            for t in kids]
+
+
 def delete_ticket(ticket_id: int) -> bool:
     """Permanently delete a ticket. FK cascades remove its events, notifications,
     and relatedness links (both directions); child tickets are unnested, never

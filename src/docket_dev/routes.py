@@ -233,6 +233,15 @@ def _detail(ticket_id: int) -> dict:
     t["position"] = dk.queue_position(ticket_id)
     t["links"] = dk.links_for(ticket_id)
     t["perf"] = dk.platform_performance(t) if t["status"] == "done" else None
+    # Hierarchy context for the detail view: the parent story (if nested) and
+    # the tasks/bugs nested under this ticket (if it's a story).
+    t["children"] = dk.children_of(ticket_id)
+    t["parent"] = None
+    if t.get("parent_id"):
+        p = dk.get_ticket(t["parent_id"])
+        if p:
+            t["parent"] = {k: p.get(k) for k in ("id", "ref", "title", "type",
+                                                 "status", "status_label")}
     return t
 
 

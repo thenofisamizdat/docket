@@ -87,6 +87,12 @@
   .mx-cell.dragover{background:var(--panel2);border-color:var(--accent)}
   .mx-cell .cards{padding:6px;gap:6px;overflow:visible;min-height:0;flex:1}
   .mx-cell .empty{padding:8px 4px}
+  .mx-cell.folded{min-height:30px;justify-content:center;padding:4px 10px;
+                  font-size:11px;color:var(--dim)}
+  .mx-epic.folded{padding:6px 12px}
+  .caret{background:none;border:0;color:var(--dim);cursor:pointer;padding:0 2px;
+         font-size:11px;line-height:1}
+  .caret:hover{color:var(--text)}
   .epic-stats{display:flex;gap:10px;margin-top:4px;font-size:11px;color:var(--dim)}
   .epic-stats b{color:var(--text);font-weight:650}
   .ebar{height:5px;border-radius:4px;background:var(--bg);overflow:hidden;margin-top:7px}
@@ -730,6 +736,16 @@ function matrixCols(){
     .concat([{id: "done", label: "Done", sub: "shipped"}]);
 }
 
+/* Collapsed rows, persisted across reloads (keyed per view + group name). */
+let FOLDED = new Set(JSON.parse(localStorage.getItem("roadmap-folded") || "[]"));
+const foldKey = g => VIEW + ":" + g.name;
+function toggleFold(g){
+  const k = foldKey(g);
+  FOLDED.has(k) ? FOLDED.delete(k) : FOLDED.add(k);
+  localStorage.setItem("roadmap-folded", JSON.stringify([...FOLDED]));
+  render();
+}
+
 /* groups: [{name, color, cards, extra?, patch(ticket) -> body-or-null}] */
 function buildMatrix(board, groups){
   if (!groups.length){
@@ -750,8 +766,9 @@ function buildMatrix(board, groups){
     mx.appendChild(h);
   }
   for (const g of groups){
-    mx.appendChild(rowHead(g));
-    for (const c of cols) mx.appendChild(matrixCell(g, c));
+    const folded = FOLDED.has(foldKey(g));
+    mx.appendChild(rowHead(g, folded));
+    for (const c of cols) mx.appendChild(matrixCell(g, c, folded));
   }
   board.appendChild(mx);
 }
@@ -763,17 +780,20 @@ function cellLane(t){
   return t.week_lane ? "w" + t.week_lane : "backlog";
 }
 
-function rowHead(g){
+function rowHead(g, folded){
   const s = epicStats(g.cards);
   const el = document.createElement("div");
-  el.className = "mx-epic";
+  el.className = "mx-epic" + (folded ? " folded" : "");
   el.style.borderTopColor = g.color;
   el.innerHTML = `
     <div class="t" style="font-weight:650;font-size:13px;color:${g.color};display:flex;align-items:center;gap:6px">
+      <button class="caret" title="${folded ? "Expand" : "Minimize"} this row">${folded ? "▸" : "▾"}</button>
       <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(g.name)}</span>
       <span style="color:var(--dim);font-weight:400;font-size:11px">· ${g.cards.length}</span>
+      ${folded ? `<span style="color:var(--dim);font-weight:400;font-size:11px">· <b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>` : ""}
       <span class="grow"></span>
-      ${g.onDelete ? `<button class="mini gdel" title="Delete this epic — its tickets are kept, they just lose the link">✕</button>` : ""}</div>
+      ${!folded && g.onDelete ? `<button class="mini gdel" title="Delete this epic — its tickets are kept, they just lose the link">✕</button>` : ""}</div>` +
+    (folded ? "" : `
     <div class="epic-stats">
       <span><b>${fmtH(s.est)}</b> est</span>
       <span><b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>
@@ -781,20 +801,27 @@ function rowHead(g){
       <span style="margin-left:auto"><b>${Math.round(s.pct*100)}%</b></span>
     </div>
     <div class="ebar"><i style="width:${Math.round(s.pct*100)}%;background:${g.color}"></i></div>` +
-    (g.extra || "");
+    (g.extra || ""));
+  el.querySelector(".caret").addEventListener("click", () => toggleFold(g));
   const del = el.querySelector(".gdel");
   if (del) del.addEventListener("click", g.onDelete);
   return el;
 }
 
-function matrixCell(g, col){
+function matrixCell(g, col, folded){
   const el = document.createElement("div");
-  el.className = "mx-cell" + (col.current ? " current" : "");
-  const wrap = document.createElement("div"); wrap.className = "cards";
+  el.className = "mx-cell" + (col.current ? " current" : "") + (folded ? " folded" : "");
   const cards = g.cards.filter(t => cellLane(t) === col.id);
-  for (const {t, child} of epicOrder(cards))
-    wrap.appendChild(card(t, col.id, {epicView: true, color: t.epic_color || g.color, child}));
-  el.appendChild(wrap);
+  if (folded){
+    // Compact strip: just the count + open hours; still a live drop target.
+    const rem = cards.reduce((s2,t) => s2 + (isDone(t) ? 0 : (t.effective_remaining ?? t.estimate_hours ?? 0)), 0);
+    el.textContent = cards.length ? `${cards.length}${rem ? " · " + fmtH(rem) : ""}` : "";
+  } else {
+    const wrap = document.createElement("div"); wrap.className = "cards";
+    for (const {t, child} of epicOrder(cards))
+      wrap.appendChild(card(t, col.id, {epicView: true, color: t.epic_color || g.color, child}));
+    el.appendChild(wrap);
+  }
   if (col.id !== "done"){       // Done is lifecycle-driven, not drag-driven
     el.addEventListener("dragover", e => { e.preventDefault(); el.classList.add("dragover"); });
     el.addEventListener("dragleave", () => el.classList.remove("dragover"));
