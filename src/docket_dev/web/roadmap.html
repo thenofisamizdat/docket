@@ -347,6 +347,17 @@ let TOKEN = null, BOARD = null, ANALYTICS = null, TICKETS = [], EPICS = [], USER
 let EPIC = "";   // page-wide epic filter ("" = all) — scopes lanes, burndown, analytics
 let VIEW = ["epics","people"].includes(localStorage.getItem("roadmap-view"))
   ? localStorage.getItem("roadmap-view") : "weeks";
+// Deep link: /roadmap?view=epics&epic=N (the board's epic chip) — consume + strip.
+(function(){
+  const q = new URLSearchParams(location.search);
+  if (["weeks","epics","people"].includes(q.get("view"))) VIEW = q.get("view");
+  if (q.get("epic")) EPIC = q.get("epic");
+  if (q.has("view") || q.has("epic")){
+    q.delete("view"); q.delete("epic");
+    history.replaceState(null, "", location.pathname + (q.toString() ? "?" + q.toString() : ""));
+    localStorage.setItem("roadmap-view", VIEW);
+  }
+})();
 let PAFILTER = {type:'all', source:'all', status:'all', assignee:'all', days:'all', epic:'all'};
 
 /* ---------------- api ---------------- */
@@ -1185,6 +1196,15 @@ document.getElementById("ticketClose").addEventListener("click", closeTicketView
 window.addEventListener("message", e => {
   if (e.data === "docket-ticket-close") closeTicketView();
   else if (e.data === "docket-ticket-changed") load();
+  else if (e.data && e.data.type === "docket-open-epic"){
+    // Epic chip clicked inside the embedded ticket view → close it and focus
+    // the roadmap on that epic's row.
+    document.getElementById("ticketOverlay").classList.remove("open");
+    document.getElementById("ticketFrame").src = "about:blank";
+    EPIC = String(e.data.epicId || "");
+    setView("epics");
+    load();
+  }
 });
 
 /* (kept for reference by older links; the modal above is the primary path) */
@@ -1523,6 +1543,7 @@ function drawBurndown(){
 
 window.addEventListener("resize", () => { if (BOARD){ drawBurndown(); drawWeekLoad(); } });
 setInterval(() => TOKEN && load(), 30000);   // keep the counter honest
+setView(VIEW);   // sync the toggle buttons with the restored/deep-linked view
 load();
 </script>
 </body>

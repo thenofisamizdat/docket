@@ -160,11 +160,16 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
             <div className="sticky top-0 bg-white border-b border-slate-200 px-5 py-3 flex items-center gap-2 z-10">
               <span className="font-mono text-xs text-slate-400">{t.ref}</span>
               {t.epic_name && (
-                <span className="text-[11px] font-medium px-2 py-0.5 rounded-full truncate max-w-[12rem]"
+                <button
+                  className="text-[11px] font-medium px-2 py-0.5 rounded-full truncate max-w-[12rem] hover:ring-1"
                   style={{ background: `${t.epic_color}1f`, color: t.epic_color }}
-                  title={`Epic: ${t.epic_name}`}>
+                  title={`Jump to the “${t.epic_name}” epic on the roadmap`}
+                  onClick={() => {
+                    if (bare) window.parent.postMessage({ type: 'docket-open-epic', epicId: t.epic_id }, '*')
+                    else window.location.assign(`/roadmap?view=epics&epic=${t.epic_id}`)
+                  }}>
                   {t.epic_name}
-                </span>
+                </button>
               )}
               {t.parent && (
                 <button onClick={() => setTicketId(t.parent.id)}
