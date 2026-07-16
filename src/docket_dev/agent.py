@@ -153,6 +153,13 @@ CODEX_MAX_EST = float(os.environ.get("DOCKET_CODEX_MAX_EST", "16"))
 # holds pickups entirely rather than manufacturing failures.
 QUOTA_LOW_PCT = float(os.environ.get("DOCKET_QUOTA_LOW_PCT", "15"))
 QUOTA_FLOOR_PCT = float(os.environ.get("DOCKET_QUOTA_FLOOR_PCT", "3"))
+# Parallel ticket workers: each claims a queued ticket atomically and runs the
+# whole pipeline in its own git worktree. Workers spend most of their life
+# blocked on engine subprocesses, so a small pool multiplies throughput without
+# multiplying load; the quota-aware router/failover govern spend as usual.
+AGENT_WORKERS = max(1, int(os.environ.get("DOCKET_AGENT_WORKERS", "2")))
+# git worktree add/remove on one repo must not interleave (index/refs locks).
+_WORKTREE_LOCK = threading.Lock()
 
 
 def _engine_headroom() -> tuple[float | None, float | None]:
@@ -1326,7 +1333,8 @@ def process_ticket(t: dict) -> None:
     act = lambda d: dk.set_activity(tid, d)
 
     try:
-        workdir, _branch = workdir_for(t)
+        with _WORKTREE_LOCK:
+            workdir, _branch = workdir_for(t)
     except subprocess.CalledProcessError as e:
         return _stall(tid, f"worktree setup failed: {e.stderr or e}")
 
@@ -1354,7 +1362,7 @@ def process_ticket(t: dict) -> None:
     # need a person — decisions, process, legal, user testing — bounce to the
     # requester without spending build-engine budget. Runs on codex (flat-rate)
     # when available, else the light model. A gate failure is never fatal.
-    dk.transition(tid, "assessment", actor="agent", summary="Picked up by the agent")
+    # (The queued→assessment transition already happened in the atomic claim.)
     act("Gate: is this buildable by an agent?")
     g = run_phase(gate_prompt(t), workdir, max_turns=1, max_budget_usd=0.3,
                   model=LIGHT_MODEL, label="gate", on_activity=act,
@@ -1454,7 +1462,8 @@ def process_ticket(t: dict) -> None:
     # MAX_DEV_PASSES attempts to ACT on what the review found before giving up.
     # The old code promised "one corrective loop" but stalled on the first FAIL
     # without ever re-running development; that single bug stalled most tickets.
-    wt, branch = ensure_worktree(t)
+    with _WORKTREE_LOCK:
+        wt, branch = ensure_worktree(t)
     _mirror_agents_md(wt)
     dk.transition(tid, "in_development", actor="agent")
     # What this ticket changed is measured against `base_ref`. For branch work
@@ -2147,9 +2156,11 @@ _deferred_logged: set = set()
 
 
 def run_once() -> bool:
-    """Work the highest-priority PICKABLE queued ticket. Human-owned decision
-    tickets and children of unanswered decisions stay queued untouched (logged
-    once per reason) — answering the decision unblocks them automatically."""
+    """Claim and work the highest-priority PICKABLE queued ticket. Human-owned
+    decision tickets and children of unanswered decisions stay queued untouched
+    (logged once per reason) — answering the decision unblocks them
+    automatically. The claim is an atomic compare-and-set so parallel workers
+    never double-pick."""
     for t in dk.queue():
         why = dk.pickup_block_reason(t)
         if why:
@@ -2158,6 +2169,8 @@ def run_once() -> bool:
                 log(f"DKT-{t['id']} left in queue — {why}")
                 _deferred_logged.add(key)
             continue
+        if not dk.claim_for_assessment(t["id"]):
+            continue    # another worker won the race — try the next ticket
         try:
             process_ticket(t)
         except Exception as e:
@@ -2166,42 +2179,64 @@ def run_once() -> bool:
     return False
 
 
+def _worker_loop(n: int) -> None:
+    """One ticket worker: claim → full pipeline → repeat. Transport control and
+    quota starvation gate pickups here (silently — the housekeeping thread owns
+    the state-change log lines)."""
+    while True:
+        try:
+            if (dk.get_control("pipeline", "running") or "running") != "running":
+                time.sleep(POLL_SECS)
+                continue
+            c_left, x_left = _engine_headroom()
+            starved = (c_left is not None and c_left <= QUOTA_FLOOR_PCT
+                       and (x_left is not None and x_left <= QUOTA_FLOOR_PCT
+                            if CODEX_ENABLED else True))
+            if starved or not run_once():
+                time.sleep(POLL_SECS)
+        except Exception as e:
+            log(f"[worker-{n}] loop error: {e}")
+            time.sleep(POLL_SECS)
+
+
 def main() -> int:
     once = "--once" in sys.argv
     log(f"starting (writes={'ON' if WRITES_ENABLED else 'OFF'}, model={MODEL}, "
         f"engines={'+'.join(ENGINES)}"
         + (f" [codex={CODEX_MODEL} as {CODEX_USER or 'self'}]" if CODEX_ENABLED else "")
-        + f", once={once})")
+        + f", workers={1 if once else AGENT_WORKERS}, once={once})")
     for r in dk.requeue_stuck_agent_tickets():
         log(f"resumed DKT-{r['id']} (was {r['from']}) -> queued")
     if once:
         ran = run_once()
         log("worked one ticket" if ran else "queue empty")
         return 0
+    # Ticket workers run the pipeline; this (main) thread keeps housekeeping —
+    # PR reconciliation, auto-deploy, notifications — and owns the state-change
+    # log lines so control/quota flips are announced exactly once.
+    for i in range(1, AGENT_WORKERS + 1):
+        threading.Thread(target=_worker_loop, args=(i,), daemon=True,
+                         name=f"worker-{i}").start()
     last_ctl = ""
+    last_starved = False
     while True:
         try:
-            # Operator transport control (board header): paused/stopped = no new
-            # pickups; housekeeping (PR reconcile, deploys, mail) keeps running.
             ctl = dk.get_control("pipeline", "running") or "running"
             if ctl != last_ctl:
                 log(f"pipeline control → {ctl}")
                 last_ctl = ctl
-            reconcile_merged_prs()
-            auto_deploy_tick()
-            drain_notifications()
-            # Both engines effectively out of quota → hold pickups (quota feed
-            # is cached 60s; a side that errors reads as None = not exhausted).
             c_left, x_left = _engine_headroom()
             starved = (c_left is not None and c_left <= QUOTA_FLOOR_PCT
                        and (x_left is not None and x_left <= QUOTA_FLOOR_PCT
                             if CODEX_ENABLED else True))
-            if starved != getattr(main, "_starved", False):
-                main._starved = starved
+            if starved != last_starved:
+                last_starved = starved
                 log("both engines out of quota — holding pickups until a window resets"
                     if starved else "quota recovered — resuming pickups")
-            if ctl != "running" or starved or not run_once():
-                time.sleep(POLL_SECS)
+            reconcile_merged_prs()
+            auto_deploy_tick()
+            drain_notifications()
+            time.sleep(POLL_SECS)
         except KeyboardInterrupt:
             log("stopping")
             return 0

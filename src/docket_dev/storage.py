@@ -967,7 +967,44 @@ def pickup_block_reason(t: Dict[str, Any]) -> str:
         r = rows[0]
         return (f"deferred until decision DKT-{r['id']} is answered "
                 f"({r['title'][:70]})")
+    # One story child at a time: siblings usually touch the same code, so two
+    # workers building them concurrently just manufactures merge conflicts.
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" * len(AGENT_STAGES))
+        busy = conn.execute(
+            f"""SELECT id FROM tickets WHERE parent_id=? AND id != ?
+                AND status IN ({placeholders}) LIMIT 1""",
+            (pid, t["id"], *AGENT_STAGES)).fetchone()
+    finally:
+        conn.close()
+    if busy:
+        return f"sibling DKT-{busy['id']} is being worked now — one story child at a time"
     return ""
+
+
+def claim_for_assessment(ticket_id: int) -> bool:
+    """Atomically claim a queued ticket for the agent — the pickup race guard
+    for parallel workers. Compare-and-set on status; exactly one worker wins.
+    Records the same pickup transition event transition() would have."""
+    conn = _connect()
+    try:
+        now = utcnow_iso()
+        cur = conn.execute(
+            "UPDATE tickets SET status='assessment', updated_at=? "
+            "WHERE id=? AND status='queued'", (now, ticket_id))
+        if cur.rowcount != 1:
+            conn.commit()
+            return False
+        conn.execute(
+            """INSERT INTO ticket_events (ticket_id, ts, phase, actor, kind, summary, payload)
+               VALUES (?,?,?,?,?,?,?)""",
+            (ticket_id, now, "assessment", "agent", "transition",
+             "Picked up by the agent", ""))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
 def next_in_queue() -> Optional[Dict[str, Any]]:
