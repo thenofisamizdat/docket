@@ -200,6 +200,38 @@ def _is_transient(text: str) -> bool:
     return any(m in low for m in _TRANSIENT_MARKERS)
 
 
+# A usage/session-limit refusal from the claude CLI is NOT transient — retrying
+# is pointless until the subscription window resets, and treating it as transient
+# churns the whole queue through auto-requeues (each pickup fails in seconds and
+# burns one of the ticket's bounded recoveries). Instead: remember that claude is
+# limited for a cooldown window and fail phases over to codex, so the queue keeps
+# moving on the second engine until claude comes back.
+_LIMIT_MARKERS = ("session limit", "usage limit", "weekly limit", "hit your limit",
+                  "limit reached", "out of extra usage")
+CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("DOCKET_CLAUDE_LIMIT_COOLDOWN", "600"))
+_claude_limited_until = 0.0
+
+
+def _is_usage_limit(text: str) -> bool:
+    low = (text or "").lower()
+    return (any(m in low for m in _LIMIT_MARKERS)
+            or ("limit" in low and "resets" in low))
+
+
+def _claude_limited() -> bool:
+    return time.time() < _claude_limited_until
+
+
+def _mark_claude_limited(text: str) -> None:
+    global _claude_limited_until
+    _claude_limited_until = time.time() + CLAUDE_LIMIT_COOLDOWN
+    log(f"  claude usage limit hit ({(text or '').strip()[:80]}) — "
+        + (f"routing phases to codex for the next {CLAUDE_LIMIT_COOLDOWN // 60}min, "
+           f"then re-probing claude"
+           if CODEX_ENABLED else
+           "codex is NOT available here, so work will requeue until the limit resets"))
+
+
 # A SCOPE failure = the phase ran out of room (max turns / budget). The reason is
 # "too big / too hard for the resources given", so the right correction is more
 # capability — a stronger model + bigger limits — not a blind re-run.
@@ -255,6 +287,11 @@ def run_claude(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
     out = None
     for attempt in range(1, AGENT_RETRIES + 1):
         out = _run_claude_once(prompt, cwd, on_activity=on_activity, **kw)
+        if out["is_error"] and _is_usage_limit(out["text"]):
+            # Subscription window exhausted — no amount of backoff fixes this.
+            _mark_claude_limited(out["text"])
+            out["usage_limited"] = True
+            return out
         if not out["is_error"] or not _is_transient(out["text"]):
             return out
         if attempt >= AGENT_RETRIES:
@@ -282,15 +319,36 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
     the reason' principle: a scope problem gets more capability, not a blind re-run.
 
     `engine="codex"` routes the phase to the Codex runner instead (no turn/budget
-    flags there — the timeout guards it; SCOPE escalation is a Claude concept)."""
+    flags there — the timeout guards it; SCOPE escalation is a Claude concept).
+
+    While claude is usage-limited, claude phases fail over to codex so the queue
+    keeps moving; read-only phases (those that disallow Edit/Write) run codex in
+    its read-only sandbox since codex has no per-tool policy flags."""
+    readonly = "Edit" in (kw.get("disallowed_tools") or ())
+
+    def _codex(why: str = "") -> dict:
+        if why:
+            log(f"  {label or 'phase'}: {why}")
+            if on_activity:
+                try:
+                    on_activity(f"{label or 'phase'}: {why}")
+                except Exception:
+                    pass
+        o = run_codex(prompt, cwd, on_activity=on_activity,
+                      timeout=kw.get("timeout", 900), model=None,
+                      sandbox="read-only" if readonly else None)
+        o.setdefault("engine", "codex")
+        return o
+
+    if engine != "codex" and CODEX_ENABLED and _claude_limited():
+        return _codex("claude is usage-limited — running on codex instead")
     if engine == "codex" and CODEX_ENABLED:
-        out = run_codex(prompt, cwd, on_activity=on_activity,
-                        timeout=kw.get("timeout", 900), model=None)
-        out.setdefault("engine", "codex")
-        return out
+        return _codex()
     out = run_claude(prompt, cwd, max_turns=max_turns, max_budget_usd=max_budget_usd,
                      model=model, on_activity=on_activity, **kw)
     out.setdefault("engine", "claude")
+    if out.get("usage_limited") and CODEX_ENABLED:
+        return _codex("claude hit its usage limit — failing over to codex")
     if out["is_error"] and _is_scope(out):
         msg = (f"{label or 'phase'} ran out of room — escalating to {STRONG_MODEL} "
                f"with 2× turns/budget and retrying once")
@@ -305,6 +363,8 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
                          on_activity=on_activity, **kw)
         out["escalated"] = True
         out.setdefault("engine", "claude")
+        if out.get("usage_limited") and CODEX_ENABLED:
+            return _codex("claude hit its usage limit — failing over to codex")
     return out
 
 
@@ -454,7 +514,7 @@ def run_codex(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
 
 
 def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
-                    model=None, **_ignored) -> dict:
+                    model=None, sandbox=None, **_ignored) -> dict:
     """Invoke Codex CLI headless in `cwd`, streaming JSONL events. Mirrors the
     claude runner's return shape: {text, is_error, cost, turns, ...}. Codex has
     no per-phase turn/budget flags — the subprocess timeout is the guardrail —
@@ -470,7 +530,8 @@ def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
         return out
     _own_tree_for_codex(cwd)
     inner = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check",
-             "--dangerously-bypass-approvals-and-sandbox",
+             *(["--sandbox", sandbox] if sandbox
+               else ["--dangerously-bypass-approvals-and-sandbox"]),
              "-C", str(cwd), "-m", model or CODEX_MODEL, prompt]
     if CODEX_USER:
         path = f"{Path(CODEX_BIN).parent}:{os.environ.get('PATH', '')}"
@@ -942,15 +1003,16 @@ def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "
     DEFECT failures by the in-dev corrective loop (re-implement, model-escalated);
     this router is the terminal decision once those avenues are spent."""
     tid = t["id"]
-    # Fast deterministic path — an obvious infra blip needs no LLM to diagnose.
-    if _is_transient(failure):
+    # Fast deterministic paths — an obvious infra blip (or an exhausted claude
+    # usage window with no codex to fail over to) needs no LLM to diagnose.
+    if _is_transient(failure) or _is_usage_limit(failure):
         return _recover_or_stall(tid, f"{phase} failed: {failure[:160]}", transient=True)
     act = lambda d: dk.set_activity(tid, d)
     act("Diagnosing the failure to choose the right recovery")
-    tr = run_claude(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
-                    allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
-                    permission_mode="default", max_turns=10, max_budget_usd=1.0,
-                    on_activity=act)
+    tr = run_phase(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
+                   allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
+                   permission_mode="default", max_turns=10, max_budget_usd=1.0,
+                   label="triage", on_activity=act)
     if tr["is_error"]:
         # Couldn't even diagnose — give it another whole pass rather than stalling.
         return _recover_or_stall(tid, f"{phase} failed (triage unavailable): {failure[:160]}",
@@ -989,6 +1051,8 @@ def choose_engine(t: dict) -> tuple[str, str]:
         return "claude", "pinned to codex, but codex is not available here"
     if not CODEX_ENABLED:
         return "claude", ""
+    if _claude_limited():
+        return "codex", "claude is usage-limited — codex takes the queue"
     if int(t.get("iteration") or 0) >= 1:
         return "claude", "resubmitted work goes to the judgment lane"
     if _auto_retry_count(t["id"]) >= 2:
@@ -1308,9 +1372,10 @@ def process_ticket(t: dict) -> None:
 
     # --- Test instructions for the human reviewer (User Review phase) ---
     act("Writing test instructions for the reviewer")
-    ti = run_claude(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
-                    disallowed_tools=["Edit", "Write"], permission_mode="default",
-                    max_turns=10, max_budget_usd=1.0, on_activity=act)
+    ti = run_phase(test_instructions_prompt(t), wt, allowed_tools=READONLY_TOOLS,
+                   disallowed_tools=["Edit", "Write"], permission_mode="default",
+                   max_turns=10, max_budget_usd=1.0, label="test instructions",
+                   on_activity=act)
     if not ti["is_error"] and ti["text"].strip():
         instructions = _strip_control(ti["text"])
         if not verified:
