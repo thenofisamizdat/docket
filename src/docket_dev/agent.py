@@ -1241,6 +1241,26 @@ def _mirror_agents_md(workdir: Path) -> None:
         log(f"  (AGENTS.md mirror skipped: {e})")
 
 
+def _stop_requested(tid: int) -> bool:
+    """⏹ Stop aborts the in-flight ticket at the next phase boundary: the ticket
+    goes cleanly back to the queue (a system requeue, so it costs the ticket
+    nothing) and the loop idles until the operator presses play."""
+    try:
+        if dk.get_control("pipeline", "running") != "stopped":
+            return False
+    except Exception:
+        return False
+    log(f"DKT-{tid} — pipeline stopped by the operator, returning ticket to the queue")
+    try:
+        dk.add_event(tid, "note", actor="agent",
+                     summary="⏹ Pipeline stopped by the operator — work aborted at a "
+                             "phase boundary; the ticket is back in the queue.")
+        dk.transition(tid, "queued", actor="system", summary="Pipeline stopped — requeued")
+    except Exception as e:
+        log(f"  (stop-requeue failed: {e})")
+    return True
+
+
 def process_ticket(t: dict) -> None:
     tid = t["id"]
     log(f"Picking up {t['ref']} — {t['title']!r} (priority {t['priority']})")
@@ -1288,6 +1308,9 @@ def process_ticket(t: dict) -> None:
             return _to_needs_info(t, ("This ticket needs a person, not the build "
                                       f"agent: {greason or 'human decision/process work'}"),
                                   phase="gate")
+
+    if _stop_requested(tid):
+        return
 
     # --- Assessment (read-only) ---
     act("Reading the codebase to assess the request")
@@ -1341,6 +1364,9 @@ def process_ticket(t: dict) -> None:
                      summary="Ask is a bit vague but low-priority — proceeding best-effort "
                              f"with assumptions. Open question: {questions or 'n/a'}")
 
+    if _stop_requested(tid):
+        return
+
     # --- Planning (read-only) ---
     dk.transition(tid, "planning", actor="agent")
     act("Drafting an implementation plan")
@@ -1387,6 +1413,8 @@ def process_ticket(t: dict) -> None:
     verified = False          # True only on an EXECUTED, evidence-backed PASS
     unverified_reason = ""    # set when the reviewer returns UNVERIFIED
     for attempt in range(1, MAX_DEV_PASSES + 1):
+        if _stop_requested(tid):
+            return
         # DEFECT escalation: if the default model couldn't pass its own review,
         # corrective passes use more capability aimed exactly at the bug rather
         # than re-running what just failed — for claude that's the stronger
@@ -2080,12 +2108,19 @@ def main() -> int:
         ran = run_once()
         log("worked one ticket" if ran else "queue empty")
         return 0
+    last_ctl = ""
     while True:
         try:
+            # Operator transport control (board header): paused/stopped = no new
+            # pickups; housekeeping (PR reconcile, deploys, mail) keeps running.
+            ctl = dk.get_control("pipeline", "running") or "running"
+            if ctl != last_ctl:
+                log(f"pipeline control → {ctl}")
+                last_ctl = ctl
             reconcile_merged_prs()
             auto_deploy_tick()
             drain_notifications()
-            if not run_once():
+            if ctl != "running" or not run_once():
                 time.sleep(POLL_SECS)
         except KeyboardInterrupt:
             log("stopping")

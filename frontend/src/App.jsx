@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle, CalendarRange, Rocket, Upload, Layers } from 'lucide-react'
+import { ClipboardList, Plus, LogOut, RefreshCw, LayoutGrid, ListChecks, BarChart3, Users, HelpCircle, CalendarRange, Rocket, Upload, Layers, Play, Pause, Square } from 'lucide-react'
 import { api, getToken, getName, clearSession } from './api.js'
 import Login from './components/Login.jsx'
 import Board from './components/Board.jsx'
@@ -11,6 +11,47 @@ import TicketDetail from './components/TicketDetail.jsx'
 import NewTicketModal from './components/NewTicketModal.jsx'
 import BulkUpload from './components/BulkUpload.jsx'
 import EpicsModal from './components/EpicsModal.jsx'
+
+function QuotaBar({ label, pct, color, title }) {
+  return (
+    <div className="flex items-center gap-1" title={title}>
+      <span className="text-[10px] font-semibold text-slate-500 uppercase">{label}</span>
+      <div className="w-14 h-2 rounded bg-slate-200 overflow-hidden">
+        <div className={`h-full ${color}`} style={{ width: `${Math.max(0, Math.min(100, pct))}%` }} />
+      </div>
+      <span className="text-[10px] text-slate-600 tabular-nums">{Math.round(pct)}%</span>
+    </div>
+  )
+}
+
+// Percent of subscription quota still AVAILABLE per engine (claude is live;
+// codex is as-of its last run) plus the combined mean. Hover for windows/resets.
+function QuotaMeter({ quota }) {
+  if (!quota) return null
+  const c = quota.claude || {}
+  const x = quota.codex || {}
+  const fmtT = (iso) => (iso ? new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?')
+  return (
+    <div className="flex items-center gap-3">
+      {'available_pct' in c ? (
+        <QuotaBar label="claude" pct={c.available_pct} color="bg-indigo-500"
+          title={`Claude quota available: ${c.available_pct}% — session ${c.session_used_pct ?? '?'}% used (resets ${fmtT(c.session_resets_at)}), week ${c.weekly_used_pct ?? '?'}% used`} />
+      ) : (
+        <span className="text-[10px] text-slate-400" title={c.error || 'unavailable'}>claude ?</span>
+      )}
+      {'available_pct' in x ? (
+        <QuotaBar label="codex" pct={x.available_pct} color="bg-teal-500"
+          title={`Codex quota available: ${x.available_pct}% — ${x.used_pct ?? '?'}% of the ${x.window_minutes === 10080 ? '7-day' : ''} window used${x.plan ? ` (plan: ${x.plan})` : ''}, as of last codex run ${fmtT(x.as_of)}`} />
+      ) : (
+        <span className="text-[10px] text-slate-400" title={x.error || 'unavailable'}>codex ?</span>
+      )}
+      {quota.combined_available_pct != null && (
+        <QuotaBar label="Σ" pct={quota.combined_available_pct} color="bg-slate-500"
+          title={`Combined available quota (mean of both engines): ${quota.combined_available_pct}%`} />
+      )}
+    </div>
+  )
+}
 
 export default function App() {
   const [authed, setAuthed] = useState(!!getToken())
@@ -61,6 +102,24 @@ export default function App() {
     const iv = setInterval(() => { if (view === 'board' && !BARE) loadBoard() }, 4000)
     return () => { alive = false; clearInterval(iv) }
   }, [authed, loadBoard, view])
+
+  // Pipeline transport state + engine quota (server caches quota for 60s).
+  const [pipeline, setPipeline] = useState(null)
+  const loadPipeline = useCallback(() => {
+    api.pipelineStatus().then(setPipeline).catch(() => {})
+  }, [])
+  useEffect(() => {
+    if (!authed || BARE) return
+    loadPipeline()
+    const iv = setInterval(loadPipeline, 15000)
+    return () => clearInterval(iv)
+  }, [authed, loadPipeline])
+  async function setPipelineState(state) {
+    try {
+      await api.pipelineControl(state)
+      setPipeline((p) => ({ ...(p || {}), state }))
+    } catch (e) { setErr(e.message) }
+  }
 
   function openNewTicket(prefill = null) {
     setNewPrefill(prefill)
@@ -115,6 +174,20 @@ export default function App() {
             <Rocket className="w-4 h-4" /> Build
           </a>
         </nav>
+        {pipeline && (
+          <div className="flex items-center gap-3 ml-4">
+            <div className="flex items-center rounded-lg border border-slate-300 overflow-hidden"
+              title="Pipeline — ▶ work the queue · ⏸ finish the current ticket then pick up nothing new · ⏹ abort the current ticket at its next phase boundary (it requeues) and idle">
+              {[['running', Play, 'bg-emerald-600'], ['paused', Pause, 'bg-amber-500'], ['stopped', Square, 'bg-red-600']].map(([st, Icon, on]) => (
+                <button key={st} onClick={() => setPipelineState(st)} aria-label={st}
+                  className={`px-2.5 py-1.5 ${pipeline.state === st ? `${on} text-white` : 'text-slate-500 hover:bg-slate-100'}`}>
+                  <Icon className="w-3.5 h-3.5" />
+                </button>
+              ))}
+            </div>
+            <QuotaMeter quota={pipeline.quota} />
+          </div>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <button onClick={() => setShowEpics(true)}
             className="flex items-center gap-1 px-3 py-1.5 border border-slate-300 text-slate-600 hover:bg-slate-50 rounded-lg text-sm font-medium" title="Manage epics">

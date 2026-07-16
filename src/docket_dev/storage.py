@@ -369,6 +369,12 @@ def init_db() -> None:
                          ("build_model", "TEXT NOT NULL DEFAULT ''")):       # routed model tier, e.g. opus | fable | gpt-5.5@high
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
+        # Small operator-facing switches (e.g. the pipeline play/pause/stop
+        # control) — one row per key, read by the agent loop each poll.
+        conn.execute("""CREATE TABLE IF NOT EXISTS control (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )""")
         conn.commit()
     finally:
         conn.close()
@@ -636,6 +642,25 @@ def unestimated_tickets() -> List[Dict[str, Any]]:
             "AND status NOT IN ('done','cancelled') ORDER BY id"
         ).fetchall()
         return [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_control(key: str, default: str = "") -> str:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT value FROM control WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def set_control(key: str, value: str) -> None:
+    conn = _connect()
+    try:
+        conn.execute("INSERT INTO control (key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
     finally:
         conn.close()
 

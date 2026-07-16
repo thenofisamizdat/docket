@@ -68,6 +68,9 @@ export const api = {
   me: () => req('/api/testing/me'),
 
   meta: () => req('/api/tickets/meta'),
+  pipelineStatus: () => req('/api/tickets/pipeline/status'),
+  pipelineControl: (state) =>
+    req('/api/tickets/pipeline/control', { method: 'POST', body: JSON.stringify({ state }) }),
   testers: () => req('/api/tickets/testers'),
   board: () => req('/api/tickets/board'),
   ticket: (id) => req(`/api/tickets/${id}`),

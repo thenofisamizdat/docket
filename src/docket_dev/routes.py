@@ -43,6 +43,34 @@ router = APIRouter(prefix="/api/tickets", tags=["docket"])
 _ENGINES_AVAILABLE = None   # lazy: filled by /meta from agent-side discovery
 
 
+# ---- pipeline transport control + engine quota (operator-facing) ----
+
+_PIPELINE_STATES = ("running", "paused", "stopped")
+
+
+class PipelineControlIn(BaseModel):
+    state: str
+
+
+@router.get("/pipeline/status")
+def pipeline_status(tester: dict = Depends(require_tester)):
+    """Current transport state (running|paused|stopped) + per-engine quota.
+    paused = finish the current ticket, pick up nothing new; stopped = also
+    abort the in-flight ticket at its next phase boundary (it requeues)."""
+    from docket_dev import quota
+    return {"state": dk.get_control("pipeline", "running") or "running",
+            "quota": quota.get_quota()}
+
+
+@router.post("/pipeline/control")
+def pipeline_control(body: PipelineControlIn, tester: dict = Depends(require_tester)):
+    state = (body.state or "").strip().lower()
+    if state not in _PIPELINE_STATES:
+        raise HTTPException(422, f"state must be one of {_PIPELINE_STATES}")
+    dk.set_control("pipeline", state)
+    return {"state": state}
+
+
 # ---- vocabulary (so the frontend renders the board generically) ----
 
 @router.get("/meta")
