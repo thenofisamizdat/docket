@@ -58,6 +58,13 @@ class Config:
     agent_poll_secs: int = 20
     merge_poll_secs: int = 90
     github_token: str = ""
+    # --- second engine (OpenAI Codex CLI) — optional. Empty values mean
+    # auto-discover: the agent looks for a `codex` binary + an authenticated
+    # ~/.codex home (possibly under another user's home, run via runuser).
+    codex_bin: str = ""              # path to the codex binary
+    codex_home: str = ""             # CODEX_HOME dir holding auth.json/config.toml
+    codex_user: str = ""             # OS user to run codex as (auth owner)
+    codex_model: str = "gpt-5.5"     # model for codex-engine phases
 
     # --- auto-deploy (opt-in): after a merge lands on base_branch, the agent
     #     ff-updates the project working tree and runs deploy_cmd ---
@@ -142,6 +149,10 @@ def _from_dict(project_root: Path, data: Dict[str, Any]) -> Config:
                                  "auto_merge" if agent.get("auto_merge") else "pr"),
         agent_model=agent.get("model", "opus"),
         agent_strong_model=agent.get("strong_model", "opus"),
+        codex_bin=agent.get("codex_bin", ""),
+        codex_home=agent.get("codex_home", ""),
+        codex_user=agent.get("codex_user", ""),
+        codex_model=agent.get("codex_model", "gpt-5.5"),
         agent_poll_secs=int(agent.get("poll_secs", 20)),
         merge_poll_secs=int(agent.get("merge_poll_secs", 90)),
         github_token=agent.get("github_token", "") or os.environ.get("DOCKET_GITHUB_TOKEN", ""),
@@ -197,6 +208,10 @@ def to_toml(cfg: Config) -> str:
         f"poll_secs = {cfg.agent_poll_secs}",
         f"merge_poll_secs = {cfg.merge_poll_secs}",
         f'github_token = "{esc(cfg.github_token)}"',
+        f'codex_bin = "{esc(cfg.codex_bin)}"',
+        f'codex_home = "{esc(cfg.codex_home)}"',
+        f'codex_user = "{esc(cfg.codex_user)}"',
+        f'codex_model = "{esc(cfg.codex_model)}"',
         "",
         "[deploy]",
         f"auto = {str(cfg.deploy_auto).lower()}",
@@ -274,6 +289,10 @@ def apply_env(cfg: Config) -> None:
         "DOCKET_AGENT_DEV_MODE": cfg.agent_dev_mode,
         "DOCKET_AGENT_MODEL": cfg.agent_model,
         "DOCKET_AGENT_STRONG_MODEL": cfg.agent_strong_model,
+        "DOCKET_CODEX_BIN": cfg.codex_bin,
+        "DOCKET_CODEX_HOME": cfg.codex_home,
+        "DOCKET_CODEX_USER": cfg.codex_user,
+        "DOCKET_CODEX_MODEL": cfg.codex_model,
         "DOCKET_AGENT_POLL": str(cfg.agent_poll_secs),
         "DOCKET_MERGE_POLL": str(cfg.merge_poll_secs),
         "DOCKET_MAIL_FROM": cfg.mail_from,

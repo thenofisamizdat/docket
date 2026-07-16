@@ -67,7 +67,16 @@ export default function TicketCard({ ticket, onOpen }) {
       )}
 
       <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
-        <span>{ticket.created_by || '—'}</span>
+        <span className="flex items-center gap-1.5">
+          {ticket.created_by || '—'}
+          {ticket.engine && (
+            <span className={`px-1 py-px rounded font-medium ${
+              ticket.engine === 'codex' ? 'bg-teal-50 text-teal-700' : 'bg-indigo-50 text-indigo-600'}`}
+              title={`build engine: ${ticket.engine}`}>
+              {ticket.engine}
+            </span>
+          )}
+        </span>
         <span className="flex items-center gap-2">
           {ticket.effort && (
             <span className="flex items-center gap-0.5 text-slate-500" title="agent effort so far (time · cost)">

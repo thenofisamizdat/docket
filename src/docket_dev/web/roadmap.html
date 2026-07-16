@@ -359,7 +359,7 @@ let VIEW = ["epics","people"].includes(localStorage.getItem("roadmap-view"))
     localStorage.setItem("roadmap-view", VIEW);
   }
 })();
-let PAFILTER = {type:'all', source:'all', status:'all', assignee:'all', days:'all', epic:'all'};
+let PAFILTER = {type:'all', source:'all', status:'all', assignee:'all', days:'all', epic:'all', engine:'all'};
 
 /* ---------------- api ---------------- */
 async function api(path, opts = {}) {
@@ -582,6 +582,7 @@ function paFilter(rows){
     if (f.type !== "all" && r.type !== f.type) return false;
     if (f.source === "automated" && !r.is_automated) return false;
     if (f.source === "manual" && r.is_automated) return false;
+    if (f.engine !== "all" && (r.engine || "") !== f.engine) return false;
     if (f.status === "open" && paDone(r)) return false;
     if (f.status === "done" && !paDone(r)) return false;
     if (f.assignee !== "all" && (r.assignee || r.created_by || "") !== f.assignee) return false;
@@ -629,6 +630,7 @@ function renderProjectAnalytics(){
     <div class="pa-filters">
       ${sel("type",[["all","All types"],["feature","Feature"],["story","Story"],["task","Task"],["bug","Bug"]])}
       ${sel("source",[["all","All sources"],["automated","Automated"],["manual","Manual"]])}
+      ${sel("engine",[["all","All engines"],["claude","Claude"],["codex","Codex"]])}
       ${sel("status",[["all","Any status"],["open","Open"],["done","Done"]])}
       ${sel("epic",[["all","All epics"],["none","No epic"],
         ...[...new Set(TICKETS.map(r=>r.epic_name).filter(Boolean))].sort().map(e=>[e,e])])}

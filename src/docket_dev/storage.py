@@ -362,7 +362,8 @@ def init_db() -> None:
                          ("hours_done", "REAL"),                             # actual effort logged
                          ("dev_optin", "INTEGER NOT NULL DEFAULT 0"),        # 1 = eligible for automation
                          ("epic_id", "INTEGER"),                             # epics.id; NULL = no epic
-                         ("parent_id", "INTEGER")):                          # tickets.id of the parent story; NULL = top-level
+                         ("parent_id", "INTEGER"),                           # tickets.id of the parent story; NULL = top-level
+                         ("engine", "TEXT NOT NULL DEFAULT ''")):            # build engine: ''=auto | claude | codex
             if col not in cols:
                 conn.execute(f"ALTER TABLE tickets ADD COLUMN {col} {ddl}")
         conn.commit()
@@ -641,8 +642,10 @@ _EDITABLE = {
     "title", "type", "description", "acceptance_criteria", "priority",
     "substage", "branch", "worktree_path", "pr_url", "test_instructions",
     "assignee", "touched_paths", "touched_routes", "dev_optin", "epic_id",
-    "parent_id",
+    "parent_id", "engine",
 }
+
+ENGINES = ("", "claude", "codex")   # '' = auto (the agent's router decides)
 
 
 def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
@@ -655,6 +658,10 @@ def update_ticket(ticket_id: int, **fields) -> Optional[Dict[str, Any]]:
             continue
         if k == "type" and v not in TICKET_TYPES:
             continue
+        if k == "engine":
+            v = (v or "").strip().lower()
+            if v not in ENGINES:
+                raise ValueError(f"engine must be one of {ENGINES}")
         if k == "epic_id":
             v = int(v) if v else None       # 0 / "" / None all unlink the epic
             if v is not None and v not in epics_map():
@@ -1176,6 +1183,7 @@ def analytics() -> Dict[str, Any]:
             "done_ts": dts, "cycle_secs": cs,
             "agent_secs": round(a["secs"]), "cost_usd": round(a["cost"], 4), "turns": a["turns"],
             "is_automated": a["secs"] > 0,      # the agent ran on it (has run-events)
+            "engine": t.get("engine") or "",    # build engine ('' until routed)
             "hours_done": t.get("hours_done"), "estimate_hours": t.get("estimate_hours"),
             "roadmap_status": t.get("roadmap_status"), "week_lane": t.get("week_lane"),
             "iteration": int(t.get("iteration") or 0),

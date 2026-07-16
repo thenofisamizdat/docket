@@ -364,6 +364,13 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                   <InlineSelect value={t.type} onSave={(v) => patch({ type: v })}
                     options={(meta.types || ['feature', 'bug']).map((x) => ({ value: x, label: x }))} />
                 </Field>
+                {(meta.engines || []).includes('codex') && (
+                  <Field label="Engine">
+                    <InlineSelect value={t.engine || ''} onSave={(v) => patch({ engine: v })}
+                      options={[{ value: '', label: 'auto (routed at pickup)' },
+                        ...(meta.engines || ['claude']).map((e) => ({ value: e, label: e }))]} />
+                  </Field>
+                )}
                 <Field label="Epic">
                   <div className="flex items-center gap-1.5">
                     {t.epic_color && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: t.epic_color }} />}

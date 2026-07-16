@@ -83,6 +83,54 @@ POLL_SECS = int(os.environ.get("DOCKET_AGENT_POLL", "20"))
 # the branch and recording a compare URL (Neil opens the PR by hand).
 GITHUB_TOKEN = (os.environ.get("DOCKET_GITHUB_TOKEN")
                 or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "")
+
+# --- Second engine: OpenAI Codex CLI (optional). Config values are mirrored via
+# DOCKET_CODEX_*; empty values auto-discover a codex binary + authenticated
+# ~/.codex home (possibly under another OS user's home — run via runuser). ---
+import glob as _glob
+import pwd as _pwd
+import shutil as _shutil
+
+
+def _discover_codex() -> tuple[str, str, str]:
+    """Find (bin, home, user) for codex. Explicit env/config wins; otherwise look
+    on PATH and in /home/*/.local/bin, and pair the binary with the .codex home
+    (containing auth.json) of the same user."""
+    cbin = os.environ.get("DOCKET_CODEX_BIN", "")
+    home = os.environ.get("DOCKET_CODEX_HOME", "")
+    user = os.environ.get("DOCKET_CODEX_USER", "")
+    if not cbin:
+        cbin = _shutil.which("codex") or ""
+    if not cbin:
+        hits = sorted(_glob.glob("/home/*/.local/bin/codex") +
+                      _glob.glob("/root/.local/bin/codex"))
+        cbin = hits[0] if hits else ""
+    if cbin and not home:
+        # Prefer the .codex home beside the binary's owner, then the caller's
+        # own, then ANY authenticated home on the box (the binary may live in
+        # /usr/local/bin while the login lives under a user's home).
+        cands = [Path(cbin).parent.parent.parent / ".codex", Path.home() / ".codex"]
+        cands += [Path(p).parent for p in
+                  sorted(_glob.glob("/home/*/.codex/auth.json") +
+                         _glob.glob("/root/.codex/auth.json"))]
+        for cand in cands:
+            if (cand / "auth.json").is_file():
+                home = str(cand)
+                break
+    if home and not user:
+        try:
+            owner = _pwd.getpwuid(os.stat(home).st_uid).pw_name
+            me = _pwd.getpwuid(os.geteuid()).pw_name
+            user = owner if owner != me else ""
+        except Exception:
+            user = ""
+    return cbin, home, user
+
+
+CODEX_BIN, CODEX_HOME, CODEX_USER = _discover_codex()
+CODEX_MODEL = os.environ.get("DOCKET_CODEX_MODEL", "gpt-5.5")
+CODEX_ENABLED = bool(CODEX_BIN and CODEX_HOME)
+ENGINES = ("claude", "codex") if CODEX_ENABLED else ("claude",)
 # Email sender identity for msmtp-delivered notifications.
 MAIL_FROM = os.environ.get("DOCKET_MAIL_FROM", "Docket <docket@localhost>")
 
@@ -136,7 +184,7 @@ _TRANSIENT_MARKERS = (
     "timed out", "timeout", "phase timed out", "connection", "econnreset",
     "network", "temporarily", "try again", "500 internal", "502", "503", "504",
     "internal server error", "bad gateway", "service unavailable",
-    "gateway timeout", "claude failed",
+    "gateway timeout", "claude failed", "codex failed", "stream disconnected",
 )
 
 
@@ -221,13 +269,23 @@ def run_claude(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
 
 
 def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
-              model=None, label: str = "", on_activity=None, **kw) -> dict:
+              model=None, label: str = "", on_activity=None, engine: str = "claude",
+              **kw) -> dict:
     """Run a pipeline phase resiliently, with SCOPE escalation. If the phase fails
     because it ran out of room (max turns / budget) — not an infra blip — retry it
     ONCE with a stronger model and doubled limits. This is the 'correct based on
-    the reason' principle: a scope problem gets more capability, not a blind re-run."""
+    the reason' principle: a scope problem gets more capability, not a blind re-run.
+
+    `engine="codex"` routes the phase to the Codex runner instead (no turn/budget
+    flags there — the timeout guards it; SCOPE escalation is a Claude concept)."""
+    if engine == "codex" and CODEX_ENABLED:
+        out = run_codex(prompt, cwd, on_activity=on_activity,
+                        timeout=kw.get("timeout", 900), model=None)
+        out.setdefault("engine", "codex")
+        return out
     out = run_claude(prompt, cwd, max_turns=max_turns, max_budget_usd=max_budget_usd,
                      model=model, on_activity=on_activity, **kw)
+    out.setdefault("engine", "claude")
     if out["is_error"] and _is_scope(out):
         msg = (f"{label or 'phase'} ran out of room — escalating to {STRONG_MODEL} "
                f"with 2× turns/budget and retrying once")
@@ -241,6 +299,7 @@ def run_phase(prompt: str, cwd: Path, *, max_turns: int, max_budget_usd: float,
                          max_budget_usd=max_budget_usd * 2, model=STRONG_MODEL,
                          on_activity=on_activity, **kw)
         out["escalated"] = True
+        out.setdefault("engine", "claude")
     return out
 
 
@@ -316,6 +375,164 @@ def _run_claude_once(prompt: str, cwd: Path, *, allowed_tools=None, disallowed_t
             out["text"] = (proc.stderr.read() or "claude failed")[:2000]
         except Exception:
             out["text"] = "claude failed"
+    out["duration"] = round(time.monotonic() - start, 1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Headless Codex runner (second engine)
+# ---------------------------------------------------------------------------
+
+def _codex_gitdir(cwd: Path) -> Path | None:
+    """A worktree's real git dir (…/.git/worktrees/<name>) — codex needs to write
+    the index there when it runs git itself."""
+    gitfile = cwd / ".git"
+    try:
+        if gitfile.is_file():
+            head = gitfile.read_text().strip()
+            if head.startswith("gitdir:"):
+                return Path(head.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _own_tree_for_codex(cwd: Path) -> None:
+    """Codex runs as CODEX_USER (the auth owner) while the agent runs as root, so
+    hand the working tree (and its worktree git dir) to that user. Root git keeps
+    working regardless of file ownership, so there's no chown-back."""
+    if not CODEX_USER:
+        return
+    targets = [cwd]
+    gd = _codex_gitdir(cwd)
+    if gd and gd.exists():
+        targets.append(gd)
+    for p in targets:
+        subprocess.run(["chown", "-R", CODEX_USER, str(p)], capture_output=True)
+
+
+def _summarize_codex_item(item: dict) -> str:
+    t = item.get("type", "")
+    if t == "command_execution":
+        return "Running: " + str(item.get("command", ""))[:60]
+    if t in ("file_change", "patch_apply", "file_update"):
+        return "Editing files"
+    if t == "web_search":
+        return "Searching the web"
+    if t == "mcp_tool_call":
+        return f"Using {item.get('tool', 'a tool')}"
+    return ""
+
+
+def run_codex(prompt: str, cwd: Path, *, on_activity=None, **kw) -> dict:
+    """Resilient wrapper around _run_codex_once — same transient-retry contract
+    as run_claude."""
+    out = None
+    for attempt in range(1, AGENT_RETRIES + 1):
+        out = _run_codex_once(prompt, cwd, on_activity=on_activity, **kw)
+        if not out["is_error"] or not _is_transient(out["text"]):
+            return out
+        if attempt >= AGENT_RETRIES:
+            out["retried"] = True
+            return out
+        wait = RETRY_BACKOFF_SECS * (2 ** (attempt - 1))
+        msg = (f"transient codex error ({(out['text'] or '').strip()[:60]}…) — retrying "
+               f"in {int(wait)}s (attempt {attempt + 1}/{AGENT_RETRIES})")
+        log("  " + msg)
+        if on_activity:
+            try:
+                on_activity(msg)
+            except Exception:
+                pass
+        time.sleep(wait)
+    return out
+
+
+def _run_codex_once(prompt: str, cwd: Path, *, timeout=900, on_activity=None,
+                    model=None, **_ignored) -> dict:
+    """Invoke Codex CLI headless in `cwd`, streaming JSONL events. Mirrors the
+    claude runner's return shape: {text, is_error, cost, turns, ...}. Codex has
+    no per-phase turn/budget flags — the subprocess timeout is the guardrail —
+    and ChatGPT-plan auth reports no dollar cost (tokens are recorded instead).
+    Tool policy flags (allowed/disallowed) are Claude-specific and ignored here;
+    the read-only phases never run on codex."""
+    out = {"text": "", "is_error": False, "cost": 0.0, "turns": 0, "session_id": "",
+           "subtype": "", "engine": "codex",
+           "tokens": {"input": 0, "output": 0}}
+    if not CODEX_ENABLED:
+        out["is_error"] = True
+        out["text"] = "codex engine not configured"
+        return out
+    _own_tree_for_codex(cwd)
+    inner = [CODEX_BIN, "exec", "--json", "--skip-git-repo-check",
+             "--dangerously-bypass-approvals-and-sandbox",
+             "-C", str(cwd), "-m", model or CODEX_MODEL, prompt]
+    if CODEX_USER:
+        path = f"{Path(CODEX_BIN).parent}:{os.environ.get('PATH', '')}"
+        cmd = ["runuser", "-u", CODEX_USER, "--", "env",
+               f"CODEX_HOME={CODEX_HOME}", f"PATH={path}", *inner]
+    else:
+        cmd = inner
+    env = os.environ.copy()
+    env.setdefault("CODEX_HOME", CODEX_HOME)
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
+    except FileNotFoundError:
+        out["is_error"] = True
+        out["text"] = "codex CLI not found"
+        return out
+    start = time.monotonic()
+    try:
+        for line in proc.stdout:
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                out["is_error"] = True
+                out["text"] = out["text"] or "(phase timed out)"
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type", "")
+            if t == "item.completed":
+                item = ev.get("item") or {}
+                if item.get("type") == "agent_message":
+                    out["text"] = item.get("text", "") or out["text"]
+                elif item.get("type") == "error":
+                    out["is_error"] = True
+                    out["text"] = item.get("message", "") or out["text"] or "codex failed"
+                elif on_activity:
+                    desc = _summarize_codex_item(item)
+                    if desc:
+                        on_activity(desc)
+            elif t == "turn.completed":
+                out["turns"] += 1
+                u = ev.get("usage") or {}
+                out["tokens"]["input"] += int(u.get("input_tokens") or 0)
+                out["tokens"]["output"] += int(u.get("output_tokens") or 0)
+            elif t == "turn.failed" or t == "error":
+                out["is_error"] = True
+                out["text"] = (str(ev.get("error", {}).get("message", "") if isinstance(ev.get("error"), dict)
+                               else ev.get("message", "")) or out["text"] or "codex failed")
+            elif t == "thread.started":
+                out["session_id"] = ev.get("thread_id", "") or ""
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out["is_error"] = True
+    if proc.returncode not in (0, None) and not out["text"]:
+        out["is_error"] = True
+        try:
+            out["text"] = (proc.stderr.read() or "codex failed")[:2000]
+        except Exception:
+            out["text"] = "codex failed"
+    if not out["is_error"] and not out["text"].strip():
+        out["is_error"] = True
+        out["text"] = "codex produced no final message"
     out["duration"] = round(time.monotonic() - start, 1)
     return out
 
@@ -715,6 +932,72 @@ def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "
     return _stall(tid, f"{phase} blocked: {(detail or failure)[:300]}")
 
 
+def choose_engine(t: dict) -> tuple[str, str]:
+    """Pick the build engine for a ticket: (engine, rationale).
+
+    A hand-pinned engine always wins. Otherwise route by cheap, explainable
+    heuristics: Codex takes the volume lane (small, well-specified tasks/bugs);
+    Claude keeps the judgment lane (P0s, stories, low-clarity asks, big
+    estimates, resubmits, and anything Codex already struggled on)."""
+    pinned = (t.get("engine") or "").strip().lower()
+    if pinned == "claude":
+        return "claude", "pinned"
+    if pinned == "codex":
+        if CODEX_ENABLED:
+            return "codex", "pinned"
+        return "claude", "pinned to codex, but codex is not available here"
+    if not CODEX_ENABLED:
+        return "claude", ""
+    if int(t.get("iteration") or 0) >= 1:
+        return "claude", "resubmitted work goes to the judgment lane"
+    if _auto_retry_count(t["id"]) >= 2:
+        return "claude", "repeated auto-retries — escalating engine"
+    if t["priority"] == "P0":
+        return "claude", "P0 — critical path stays on claude"
+    if t["type"] == "story":
+        return "claude", "story-sized work needs the judgment lane"
+    if (t.get("clarity_level") or "") == "low":
+        return "claude", "low-clarity ask needs interpretation"
+    est = t.get("estimate_hours")
+    if est is not None and float(est) > 6:
+        return "claude", f"estimate {est}h is above the codex threshold (6h)"
+    return "codex", (f"small, well-specified {t['type']}"
+                     + (f" (~{est}h)" if est is not None else ""))
+
+
+def _review_engine(build_engine: str) -> str:
+    """Cross-engine review: the reviewer should not share the builder's blind
+    spots, so run it on the opposite engine whenever one is available."""
+    if build_engine == "codex":
+        return "claude"
+    return "codex" if CODEX_ENABLED else "claude"
+
+
+def _engine_trailer(engine: str) -> str:
+    return ("Co-Authored-By: Codex <noreply@openai.com>" if engine == "codex"
+            else "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>")
+
+
+def _mirror_agents_md(workdir: Path) -> None:
+    """Codex reads AGENTS.md where Claude reads CLAUDE.md — keep ONE canonical
+    guidance file by symlinking AGENTS.md → CLAUDE.md in the working tree, and
+    keep the mirror out of commits via .git/info/exclude. Best-effort."""
+    if not CODEX_ENABLED:
+        return
+    try:
+        cl, ag = workdir / "CLAUDE.md", workdir / "AGENTS.md"
+        if cl.is_file() and not ag.exists():
+            ag.symlink_to("CLAUDE.md")
+            excl = MAIN_CHECKOUT / ".git" / "info" / "exclude"
+            if excl.parent.is_dir():
+                lines = excl.read_text().splitlines() if excl.is_file() else []
+                if "AGENTS.md" not in lines:
+                    with open(excl, "a") as fh:
+                        fh.write("\nAGENTS.md\n")
+    except Exception as e:
+        log(f"  (AGENTS.md mirror skipped: {e})")
+
+
 def process_ticket(t: dict) -> None:
     tid = t["id"]
     log(f"Picking up {t['ref']} — {t['title']!r} (priority {t['priority']})")
@@ -794,12 +1077,28 @@ def process_ticket(t: dict) -> None:
         log(f"  writes disabled — parked {t['ref']} at Planning")
         return
 
+    # --- Engine routing: which model family builds this ticket ---
+    engine, route_why = choose_engine(t)
+    if (t.get("engine") or "") != engine:
+        try:
+            dk.update_ticket(tid, engine=engine)
+        except Exception:
+            pass
+    if CODEX_ENABLED:
+        dk.add_event(tid, "note", actor="agent",
+                     summary=f"🔀 Build engine: **{engine}**"
+                             + (f" — {route_why}" if route_why else "")
+                             + f". Review runs on **{_review_engine(engine)}**.",
+                     payload={"engine": engine})
+        log(f"  engine → {engine}" + (f" ({route_why})" if route_why else ""))
+
     # --- In Development + Self-Review: a REAL, bounded corrective loop ---
     # The agent implements, reviews its own work, and — crucially — gets up to
     # MAX_DEV_PASSES attempts to ACT on what the review found before giving up.
     # The old code promised "one corrective loop" but stalled on the first FAIL
     # without ever re-running development; that single bug stalled most tickets.
     wt, branch = ensure_worktree(t)
+    _mirror_agents_md(wt)
     dk.transition(tid, "in_development", actor="agent")
     # What this ticket changed is measured against `base_ref`. For branch work
     # that's BASE_BRANCH; in direct_main we ARE on BASE_BRANCH, so diffing against
@@ -817,25 +1116,37 @@ def process_ticket(t: dict) -> None:
     unverified_reason = ""    # set when the reviewer returns UNVERIFIED
     for attempt in range(1, MAX_DEV_PASSES + 1):
         # DEFECT escalation: if the default model couldn't pass its own review,
-        # corrective passes use the stronger model — more capability aimed exactly
-        # at the bug, rather than re-running the same model that just failed. A
-        # resubmit (iteration > 0) means a prior shipped fix was rejected, so we
-        # start on the stronger model immediately rather than re-earning the bug.
-        pass_model = STRONG_MODEL if (attempt >= 2 or iteration >= 1) else None
+        # corrective passes use more capability aimed exactly at the bug rather
+        # than re-running what just failed — for claude that's the stronger
+        # model; for codex the escalation is CROSS-ENGINE (claude takes over).
+        # A resubmit (iteration > 0) means a prior shipped fix was rejected, so
+        # we start escalated immediately rather than re-earning the bug.
+        escalated_pass = attempt >= 2 or iteration >= 1
+        pass_engine = "claude" if (engine == "codex" and escalated_pass) else engine
+        pass_model = STRONG_MODEL if (escalated_pass and pass_engine == "claude") else None
         if attempt == 1:
-            act("Implementing the change")
+            act(f"Implementing the change ({pass_engine})")
             impl_prompt = implement_prompt(t, p["text"])
         else:
-            act(f"Addressing self-review feedback (pass {attempt}/{MAX_DEV_PASSES}, {STRONG_MODEL})")
+            act(f"Addressing self-review feedback (pass {attempt}/{MAX_DEV_PASSES}, "
+                f"{pass_model or pass_engine})")
             impl_prompt = reimplement_prompt(t, p["text"], fix_feedback)
+        if pass_engine != engine:
+            dk.add_event(tid, "note", actor="agent",
+                         summary=f"🔀 Engine escalation: corrective pass {attempt} runs on "
+                                 f"**claude** ({STRONG_MODEL}) after codex couldn't clear review.",
+                         payload={"engine": pass_engine})
         i = run_phase(impl_prompt, wt, allowed_tools=WRITE_TOOLS,
                       permission_mode="acceptEdits", max_turns=40, max_budget_usd=5.0,
-                      model=pass_model, label="implementation", on_activity=act)
+                      model=pass_model, label="implementation", on_activity=act,
+                      engine=pass_engine)
         if i["is_error"]:
             return recover(t, "implementation", i["text"], wt=wt)
         label = "**Implemented**" if attempt == 1 else f"**Revised (pass {attempt})**"
         dk.add_event(tid, "note", summary=f"{label}\n\n" + i["text"][:1500], actor="agent",
-                     payload={"cost_usd": i["cost"], "turns": i["turns"], "duration_secs": i["duration"]})
+                     payload={"cost_usd": i["cost"], "turns": i["turns"],
+                              "duration_secs": i["duration"], "engine": i.get("engine", pass_engine),
+                              **({"tokens": i["tokens"]} if i.get("tokens") else {})})
         # Commit anything this pass produced.
         _git(wt, ["add", "-A"])
         if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode != 0:
@@ -844,7 +1155,7 @@ def process_ticket(t: dict) -> None:
                 capture_output=True, text=True).stdout
             _git(wt, ["commit", "-m", f"DKT-{tid}: {t['title']}",
                       "-m", _pr_summary(t, i["text"], staged_stat),
-                      "-m", "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"])
+                      "-m", _engine_trailer(pass_engine)])
         # The real "did this ticket produce work?" measure is the whole branch vs
         # the base branch — NOT just this run's staged edits. A requeued ticket
         # whose fix was already committed on its branch in a prior pass makes no
@@ -864,21 +1175,36 @@ def process_ticket(t: dict) -> None:
             return recover(t, "implementation (no changes produced)", why, wt=wt)
         pr_body = _pr_summary(t, i["text"], files_stat)
 
-        # --- Self-Review (writes on, so it can also make small fixes itself) ---
+        # --- Self-Review (writes on, so it can also make small fixes itself).
+        # Cross-engine when possible: a reviewer from the OTHER model family
+        # doesn't share the builder's blind spots. ---
+        rev_engine = _review_engine(pass_engine)
         dk.transition(tid, "self_review", actor="agent")
-        act("Reviewing its own work + running checks")
+        act(f"Reviewing the work + running checks ({rev_engine})")
         r = run_phase(review_prompt(t), wt, allowed_tools=WRITE_TOOLS,
                       permission_mode="acceptEdits", max_turns=25, max_budget_usd=3.0,
-                      label="self-review", on_activity=act)
+                      label="self-review", on_activity=act, engine=rev_engine)
+        if r["is_error"] and rev_engine == "codex":
+            # A broken review engine must not sink a finished build — fall back
+            # to a same-engine (claude) review rather than recovering the ticket.
+            log(f"  codex review failed ({r['text'][:80]}) — falling back to claude review")
+            r = run_phase(review_prompt(t), wt, allowed_tools=WRITE_TOOLS,
+                          permission_mode="acceptEdits", max_turns=25, max_budget_usd=3.0,
+                          label="self-review", on_activity=act)
+            rev_engine = "claude"
         if r["is_error"]:
             return recover(t, "self-review", r["text"], wt=wt, diff_summary=files_stat)
         # The reviewer may have edited files; fold any such fixes into the commit.
         _git(wt, ["add", "-A"])
         if subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"]).returncode != 0:
             _git(wt, ["commit", "--amend", "--no-edit"])
-        dk.add_event(tid, "note", summary="**Self-review**\n\n" + _strip_control(r["text"])[:1500],
+        rev_label = ("**Self-review**" if rev_engine == pass_engine
+                     else f"**Cross-review** ({rev_engine} reviewing {pass_engine}'s work)")
+        dk.add_event(tid, "note", summary=rev_label + "\n\n" + _strip_control(r["text"])[:1500],
                      actor="agent", payload={"cost_usd": r["cost"], "turns": r["turns"],
-                                             "duration_secs": r["duration"]})
+                                             "duration_secs": r["duration"],
+                                             "engine": r.get("engine", rev_engine),
+                                             **({"tokens": r["tokens"]} if r.get("tokens") else {})})
         rv, fix = parse_verdict(r["text"], "REVIEW")
         if rv == "PASS":
             # Cleared with executed, evidence-backed verification.
@@ -1464,7 +1790,9 @@ def run_once() -> bool:
 def main() -> int:
     once = "--once" in sys.argv
     log(f"starting (writes={'ON' if WRITES_ENABLED else 'OFF'}, model={MODEL}, "
-        f"once={once})")
+        f"engines={'+'.join(ENGINES)}"
+        + (f" [codex={CODEX_MODEL} as {CODEX_USER or 'self'}]" if CODEX_ENABLED else "")
+        + f", once={once})")
     for r in dk.requeue_stuck_agent_tickets():
         log(f"resumed DKT-{r['id']} (was {r['from']}) -> queued")
     if once:

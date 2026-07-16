@@ -40,12 +40,23 @@ from docket_dev.auth import require_tester
 
 router = APIRouter(prefix="/api/tickets", tags=["docket"])
 
+_ENGINES_AVAILABLE = None   # lazy: filled by /meta from agent-side discovery
+
 
 # ---- vocabulary (so the frontend renders the board generically) ----
 
 @router.get("/meta")
 def get_meta(tester: dict = Depends(require_tester)):
     """The lifecycle vocabulary the UI needs to render lanes/transitions."""
+    # Which build engines this install can actually run (agent-side discovery:
+    # codex binary + authenticated home). Cached — discovery stats the disk.
+    global _ENGINES_AVAILABLE
+    if _ENGINES_AVAILABLE is None:
+        try:
+            from docket_dev.agent import ENGINES as _E
+            _ENGINES_AVAILABLE = list(_E)
+        except Exception:
+            _ENGINES_AVAILABLE = ["claude"]
     return {
         "statuses": list(dk.STATUSES),
         "status_meta": dk.STATUS_META,
@@ -53,6 +64,7 @@ def get_meta(tester: dict = Depends(require_tester)):
         "priorities": list(dk.PRIORITIES),
         "default_priority": dk.DEFAULT_PRIORITY,
         "types": list(dk.TICKET_TYPES),
+        "engines": _ENGINES_AVAILABLE,
         # Legal next-moves per status (sets aren't JSON-serialisable → lists).
         "transitions": {k: sorted(v) for k, v in dk.TRANSITIONS.items()},
     }
@@ -261,6 +273,7 @@ class TicketPatch(BaseModel):
     assignee: Optional[str] = None
     epic_id: Optional[int] = None   # 0 unlinks; omitted = unchanged
     parent_id: Optional[int] = None  # 0 unnests; omitted = unchanged
+    engine: Optional[str] = None    # ''=auto | claude | codex
 
 
 @router.patch("/{ticket_id}")
