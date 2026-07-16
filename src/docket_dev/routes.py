@@ -276,6 +276,34 @@ def patch_ticket(ticket_id: int, body: TicketPatch, tester: dict = Depends(requi
     return {"ticket": _detail(ticket_id)}
 
 
+class PlaylistIn(BaseModel):
+    markdown: str
+    dry_run: bool = True
+
+
+@router.post("/playlist")
+def apply_playlist(body: PlaylistIn, tester: dict = Depends(require_tester)):
+    """Upload a playlist — an ordered work-through instruction file. Sets the
+    build order over the listed tickets (they run before everything else); with
+    `Mode: queue` in the document it also queues them to the pipeline in that
+    order. Items match by DKT ref or exact title. `dry_run=true` previews the
+    resolution without writing. Format: docs/PLAYLIST_PLAYBOOK.md."""
+    from docket_dev import bulk_import
+    if not (body.markdown or "").strip():
+        raise HTTPException(status_code=400, detail="playlist document is empty")
+    resolved = bulk_import.resolve_playlist(bulk_import.parse_playlist(body.markdown))
+    if body.dry_run:
+        return {"dry_run": True, "mode": resolved["mode"],
+                "ordered": [{"seq": i + 1, "ref": it["ticket"]["ref"],
+                             "title": it["ticket"]["title"], "phase": it["phase"]}
+                            for i, it in enumerate(it2 for it2 in resolved["items"] if it2.get("ticket"))],
+                "unmatched": resolved["unmatched"], "warnings": resolved["warnings"],
+                "count": sum(1 for it in resolved["items"] if it.get("ticket"))}
+    result = bulk_import.apply_playlist(resolved, actor=tester.get("name", ""))
+    result["dry_run"] = False
+    return result
+
+
 @router.delete("/{ticket_id}")
 def delete_ticket(ticket_id: int, tester: dict = Depends(require_tester)):
     """Permanently delete a ticket (history and links go with it; child tickets

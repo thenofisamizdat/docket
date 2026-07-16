@@ -162,6 +162,162 @@ def parse(markdown: str) -> Dict[str, Any]:
     return {"epics": epics, "tickets": tickets, "warnings": warnings, "counts": counts}
 
 
+# ---------------------------------------------------------------------------
+# Playlists — an ordered work-through instruction file
+# ---------------------------------------------------------------------------
+#
+# A playlist tells Docket the ORDER to work tickets in (all of them or a
+# subset), optionally queueing them to the pipeline immediately:
+#
+#     # Playlist: Alpha build order
+#     Mode: queue            (or "order" — set the order only, queue nothing)
+#
+#     ## Phase 1: Foundations
+#     1. DKT-12
+#     2. Persist tus upload state to disk
+#
+#     ## Phase 2: Comms
+#     1. DKT-40 Threaded view for group chats
+#
+# Items are matched by DKT ref when present, else by exact (case-insensitive)
+# title — so a playlist can be authored against a plan file before the tickets
+# even have refs. Phases are grouping/reporting only; the global order is the
+# document order. Applying sets build_seq 1..N over the listed tickets (they
+# sort ahead of everything unlisted) and, in queue mode, hands each one to the
+# pipeline in that order.
+
+_PL_MODE = re.compile(r"^\**\s*mode\s*:?\**\s*:?\s*(queue|order)[\s\-a-z]*$", re.IGNORECASE)
+_PL_PHASE = re.compile(r"^#{1,4}\s*(?:phase\s*\d*\s*[:\-–—]?\s*)?(.*)$", re.IGNORECASE)
+_PL_ITEM = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+(.+?)\s*$")
+_PL_REF = re.compile(r"\bDKT-(\d+)\b", re.IGNORECASE)
+
+
+def parse_playlist(markdown: str) -> Dict[str, Any]:
+    """Parse a playlist document into {mode, items:[{raw, ref_id, title, phase}],
+    warnings}. No DB access."""
+    mode = "order"
+    items: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    phase = ""
+    for ln_no, line in enumerate((markdown or "").replace("\r\n", "\n").split("\n"), 1):
+        if not line.strip():
+            continue
+        m = _PL_MODE.match(line.strip())
+        if m:
+            mode = m.group(1).lower()
+            continue
+        if line.lstrip().startswith("#"):
+            mm = _PL_PHASE.match(line.strip())
+            title = (mm.group(1) if mm else "").strip()
+            if title.lower().startswith("playlist"):
+                continue                      # the document title
+            phase = title
+            continue
+        m = _PL_ITEM.match(line)
+        if not m:
+            continue                          # prose between items is ignored
+        raw = m.group(1).strip()
+        ref = _PL_REF.search(raw)
+        title = _PL_REF.sub("", raw).strip(" -–—·:\"'“”")
+        items.append({"raw": raw, "ref_id": int(ref.group(1)) if ref else None,
+                      "title": title, "phase": phase, "line": ln_no})
+    if not items:
+        warnings.append("no playlist items found — list tickets as '1. DKT-n' or '1. <exact title>'")
+    return {"mode": mode, "items": items, "warnings": warnings}
+
+
+def resolve_playlist(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Match every playlist item to a ticket (by ref, else exact title,
+    case-insensitive). Adds `ticket` (or None) to each item and reports
+    unmatched/duplicates. Read-only."""
+    conn = storage._connect()
+    try:
+        rows = conn.execute("SELECT * FROM tickets").fetchall()
+    finally:
+        conn.close()
+    tickets = [storage._row_to_ticket(r) for r in rows]
+    by_id = {t["id"]: t for t in tickets}
+    by_title: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tickets:
+        by_title.setdefault(t["title"].strip().lower(), []).append(t)
+
+    seen: set = set()
+    unmatched: List[str] = []
+    warnings = list(plan.get("warnings", []))
+    for it in plan["items"]:
+        t = None
+        if it["ref_id"] is not None:
+            t = by_id.get(it["ref_id"])
+            if not t:
+                unmatched.append(f"line {it['line']}: DKT-{it['ref_id']} does not exist")
+        elif it["title"]:
+            cands = by_title.get(it["title"].lower(), [])
+            if len(cands) == 1:
+                t = cands[0]
+            elif len(cands) > 1:
+                unmatched.append(f"line {it['line']}: title '{it['title']}' matches "
+                                 f"{len(cands)} tickets — use its DKT ref")
+            else:
+                unmatched.append(f"line {it['line']}: no ticket titled '{it['title']}'")
+        if t and t["id"] in seen:
+            warnings.append(f"line {it['line']}: {t['ref']} listed twice — first position wins")
+            t = None
+        if t:
+            seen.add(t["id"])
+        it["ticket"] = t
+    return {**plan, "unmatched": unmatched, "warnings": warnings}
+
+
+def apply_playlist(resolved: Dict[str, Any], actor: str = "") -> Dict[str, Any]:
+    """Stamp build_seq 1..N over the matched tickets in playlist order (they
+    sort ahead of every unlisted ticket) and, in queue mode, hand each one to
+    the pipeline in that order (skipping container stories and anything not
+    in Discussion — reported, never silent)."""
+    from docket_dev import roadmap as rm
+    matched = [it for it in resolved["items"] if it.get("ticket")]
+    listed_ids = {it["ticket"]["id"] for it in matched}
+    conn = storage._connect()
+    try:
+        parents = {r[0] for r in conn.execute(
+            "SELECT DISTINCT parent_id FROM tickets WHERE parent_id IS NOT NULL")}
+        for seq, it in enumerate(matched, 1):
+            conn.execute("UPDATE tickets SET build_seq=? WHERE id=?",
+                         (seq, it["ticket"]["id"]))
+        # Unlisted tickets that had a build order keep their relative order but
+        # move AFTER the playlist, so the playlist genuinely runs first.
+        others = [r["id"] for r in conn.execute(
+            "SELECT id FROM tickets WHERE build_seq IS NOT NULL "
+            "ORDER BY build_seq, id") if r["id"] not in listed_ids]
+        for off, tid in enumerate(others, 1):
+            conn.execute("UPDATE tickets SET build_seq=? WHERE id=?",
+                         (len(matched) + off, tid))
+        conn.commit()
+    finally:
+        conn.close()
+
+    ordered = [{"seq": i + 1, "ref": it["ticket"]["ref"], "title": it["ticket"]["title"],
+                "phase": it["phase"]} for i, it in enumerate(matched)]
+    queued: List[str] = []
+    skipped: List[Dict[str, Any]] = []
+    if resolved["mode"] == "queue":
+        for it in matched:
+            t = storage.get_ticket(it["ticket"]["id"])   # fresh status
+            if t["id"] in parents and t["type"] == "story":
+                skipped.append({"ref": t["ref"], "reason": "container story"})
+                continue
+            if t["status"] != "discussion":
+                skipped.append({"ref": t["ref"], "reason": f"not queueable ({t['status_label']})"})
+                continue
+            try:
+                rm.send_to_pipeline(t["id"], queue=True, actor=actor)
+                queued.append(t["ref"])
+            except ValueError as e:
+                skipped.append({"ref": t["ref"], "reason": str(e)})
+    return {"mode": resolved["mode"], "ordered": ordered, "queued": queued,
+            "skipped": skipped, "unmatched": resolved["unmatched"],
+            "warnings": resolved["warnings"], "count": len(ordered)}
+
+
 def apply(plan: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
     """Create the plan's epics and tickets. Epics are matched to existing ones
     by name (case-insensitive) and reused rather than duplicated; tickets get

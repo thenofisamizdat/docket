@@ -112,6 +112,22 @@ def to_pipeline(ticket_id: int, body: PipelineIn,
     return {"ticket": t}
 
 
+class EpicQueueIn(BaseModel):
+    queue: bool = True       # False = mark available only (manual Submit later)
+
+
+@router.post("/epics/{epic_id}/queue")
+def queue_epic(epic_id: int, body: EpicQueueIn,
+               tester: dict = Depends(require_tester)):
+    """Send a whole epic to the pipeline in build order. Container stories and
+    tickets already done/in-flight are skipped and reported. Explicit
+    automation opt-in, same as the per-ticket handoff."""
+    try:
+        return rm.queue_epic(epic_id, queue=body.queue, actor=tester.get("name", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class EstimateIn(BaseModel):
     ids: Optional[List[int]] = None      # specific tickets; default = all unestimated
 

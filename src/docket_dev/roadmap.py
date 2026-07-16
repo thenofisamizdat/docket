@@ -363,6 +363,51 @@ def send_to_pipeline(ticket_id: int, queue: bool = False,
     return storage.get_ticket(ticket_id)
 
 
+def queue_epic(epic_id: int, queue: bool = True, actor: str = "") -> Dict[str, Any]:
+    """Send a whole epic to the pipeline: every buildable ticket in the epic,
+    in build order (build_seq, then id). This is an explicit automation opt-in,
+    exactly like the per-ticket handoff.
+
+    Skipped (and reported, never silent):
+      - container stories — a story with child tickets is a tracking umbrella;
+        building it AND its children would duplicate the work
+      - tickets already done/cancelled or already in the pipeline
+      - anything the state machine refuses to queue (when `queue=True`)
+    `queue=False` only marks the tickets available (dev_optin) for a manual
+    Submit / Run Full Build instead of queueing them now."""
+    epic = storage.epics_map().get(int(epic_id))
+    if not epic:
+        raise ValueError(f"epic {epic_id} not found")
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM tickets WHERE epic_id=?", (epic_id,)).fetchall()
+        tickets = [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
+    parents = {t["parent_id"] for t in tickets if t.get("parent_id")}
+    tickets.sort(key=lambda t: (t.get("build_seq") if t.get("build_seq") is not None
+                                else 10_000, t["id"]))
+    sent: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for t in tickets:
+        if t["id"] in parents and t["type"] == "story":
+            skipped.append({"ref": t["ref"], "reason": "container story (its tasks/bugs are queued instead)"})
+            continue
+        if t["status"] in (_DONE, _VOID):
+            skipped.append({"ref": t["ref"], "reason": t["status_label"].lower()})
+            continue
+        if t["status"] != "discussion":
+            skipped.append({"ref": t["ref"], "reason": f"already in the pipeline ({t['status_label']})"})
+            continue
+        try:
+            send_to_pipeline(t["id"], queue=queue, actor=actor)
+            sent.append({"ref": t["ref"], "title": t["title"]})
+        except ValueError as e:
+            skipped.append({"ref": t["ref"], "reason": str(e)})
+    return {"epic": epic["name"], "queued" if queue else "made_available": sent,
+            "sent": len(sent), "skipped": skipped}
+
+
 def record_pipeline_done(ticket_id: int, actor: str = "agent") -> Optional[Dict[str, Any]]:
     """Write pipeline results back onto the ticket when the agent finishes it:
     auto-fill `hours_done` from the summed agent wall-clock, mark the roadmap card

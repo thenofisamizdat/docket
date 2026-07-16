@@ -255,6 +255,7 @@
   <div class="counter done"><b id="hoursDone">–</b><small>hrs done</small></div>
   <button id="newTicketBtn" class="primary" title="Create a new ticket">+ New ticket</button>
   <button id="importBtn" title="Bulk import a whole plan (epics → stories → tasks/bugs) from a markdown file">⇪ Import plan</button>
+  <button id="playlistBtn" title="Upload a playlist — an ordered instruction file telling Docket which tickets to work through, in what order">⏵ Playlist</button>
   <button id="estimateBtn" title="Auto-estimate every ticket that has no estimate yet">✨ Auto-estimate</button>
   <button id="rolloverBtn" title="Bump everything unfinished in expired weeks into the current week">Roll over week</button>
   <button id="cycleBtn">New cycle…</button>
@@ -803,6 +804,7 @@ function rowHead(g, folded){
       <span style="color:var(--dim);font-weight:400;font-size:11px">· ${g.cards.length}</span>
       ${folded ? `<span style="color:var(--dim);font-weight:400;font-size:11px">· <b style="color:var(--warn)">${fmtH(s.left)}</b> left</span>` : ""}
       <span class="grow"></span>
+      ${!folded && g.onQueue ? `<button class="mini gqueue" title="Send this whole epic to the pipeline in build order">▶</button>` : ""}
       ${!folded && g.onDelete ? `<button class="mini gdel" title="Delete this epic — its tickets are kept, they just lose the link">✕</button>` : ""}</div>` +
     (folded ? "" : `
     <div class="epic-stats">
@@ -816,6 +818,8 @@ function rowHead(g, folded){
   el.querySelector(".caret").addEventListener("click", () => toggleFold(g));
   const del = el.querySelector(".gdel");
   if (del) del.addEventListener("click", g.onDelete);
+  const qb = el.querySelector(".gqueue");
+  if (qb) qb.addEventListener("click", g.onQueue);
   return el;
 }
 
@@ -883,7 +887,8 @@ function renderEpicBoard(board){
     .map(e => ({name: e.name, color: e.color,
                 cards: all.filter(t => t.epic_id === e.id),
                 patch: t => (t.epic_id || 0) !== e.id ? {epic_id: e.id} : null,
-                onDelete: () => deleteEpic(e)}));
+                onDelete: () => deleteEpic(e),
+                onQueue: () => queueEpicMenu(e)}));
   const loose = all.filter(t => !t.epic_id);
   if (!EPIC && loose.length)
     groups.push({name: "No epic", color: "#8b96ab", cards: loose,
@@ -1005,6 +1010,34 @@ function drawUserWeeks(c, wl, col){
     g.fillText(w.week, x + w2/2, H - 1);
     g.textAlign = "left";
   });
+}
+
+/* Send a whole epic to the pipeline — the epic-level version of the per-card
+   "→ Pipeline" handoff. Container stories are skipped server-side. */
+function queueEpicMenu(e){
+  openModal(`Send epic “${escapeHtml(e.name)}” to the Docket pipeline`,
+    `<p style="color:var(--dim);margin:0 0 4px">Every buildable ticket in this epic is handed
+      to the automated dev agent <b>in build order</b>. Stories that have child tasks/bugs are
+      skipped (their children are built instead), as is anything already done or in flight.</p>`,
+    [
+      {label:"Make available", cls:"", fn:() => queueEpic(e, false)},
+      {label:"Queue now (build it)", cls:"primary", fn:() => queueEpic(e, true)},
+    ]);
+}
+async function queueEpic(e, queue){
+  closeModal();
+  try {
+    const d = await api("/api/roadmap/epics/" + e.id + "/queue",
+      {method:"POST", body: JSON.stringify({queue})});
+    toast(`${escapeHtml(e.name)}: ${d.sent} ticket(s) ${queue ? "queued" : "made available"}` +
+          (d.skipped.length ? ` · ${d.skipped.length} skipped` : ""));
+    if (d.skipped.length)
+      openModal(`${escapeHtml(e.name)} — ${d.sent} sent, ${d.skipped.length} skipped`,
+        `<div style="max-height:260px;overflow:auto;font-size:12.5px">` +
+        d.skipped.map(s => `<div style="padding:3px 0"><b>${s.ref}</b> <span style="color:var(--dim)">— ${escapeHtml(s.reason)}</span></div>`).join("") +
+        `</div>`, [{label:"OK", cls:"primary", fn: closeModal}]);
+    load();
+  } catch(err){ toast(err.message); }
 }
 
 async function deleteEpic(e){
@@ -1381,6 +1414,62 @@ async function runImport(dryRun){
       toast(`Imported ${d.count} ticket(s) across ${d.epics.length} epic(s)` +
             (d.errors?.length ? ` — ${d.errors.length} failed` : ""));
       setView("epics");
+      load();
+    }
+  } catch(err){ errEl.textContent = err.message; }
+}
+
+/* ---------------- playlist upload (ordered work-through instructions) ---------------- */
+document.getElementById("playlistBtn").addEventListener("click", () => {
+  openModal("Upload a playlist", `
+    <p style="color:var(--dim);margin:0 0 6px;font-size:12.5px">
+      An ordered list of tickets (<code>1. DKT-n</code> or <code>1. exact title</code>,
+      optionally grouped in <code>## Phase</code> sections). <code>Mode: queue</code> also
+      hands them to the pipeline in that order; <code>Mode: order</code> just sets the
+      build order for a later Run Full Build / epic queue. Preview first.</p>
+    <textarea id="plText" rows="10" style="font-family:ui-monospace,monospace;font-size:12px"
+      placeholder="# Playlist: Alpha build order&#10;Mode: queue&#10;&#10;## Phase 1: Foundations&#10;1. DKT-12&#10;2. Persist tus upload state to disk&#10;..."></textarea>
+    <label class="mini" style="display:inline-block;margin-top:6px;cursor:pointer">upload .md file
+      <input type="file" id="plFile" accept=".md,.markdown,text/markdown,text/plain" style="display:none"></label>
+    <div id="plPreview" style="max-height:220px;overflow:auto;margin-top:8px;font-size:12px"></div>
+    <div class="err" id="plErr"></div>`,
+    [{label:"Cancel", cls:"", fn: closeModal},
+     {label:"Preview", cls:"", fn: () => runPlaylist(true)},
+     {label:"Apply", cls:"primary", fn: () => runPlaylist(false)}], true);
+  document.getElementById("plFile").addEventListener("change", e => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { document.getElementById("plText").value = String(r.result); runPlaylist(true); };
+    r.readAsText(f);
+  });
+});
+
+async function runPlaylist(dryRun){
+  const md = document.getElementById("plText")?.value || "";
+  const errEl = document.getElementById("plErr"), prev = document.getElementById("plPreview");
+  if (!md.trim()){ errEl.textContent = "Paste or upload a playlist first"; return; }
+  errEl.textContent = "";
+  try {
+    const d = await api("/api/tickets/playlist", {method:"POST",
+      body: JSON.stringify({markdown: md, dry_run: dryRun})});
+    const probs = (d.unmatched || []).concat(d.warnings || []);
+    if (dryRun){
+      let phase = null;
+      prev.innerHTML =
+        `<div style="margin-bottom:6px"><b>${d.count}</b> ticket(s) · mode: <b>${d.mode === "queue" ? "queue to pipeline" : "set order only"}</b></div>` +
+        (probs.length ? `<div style="color:var(--warn);margin-bottom:6px">⚠ ${probs.map(escapeHtml).join("<br>⚠ ")}</div>` : "") +
+        d.ordered.map(o => {
+          const ph = o.phase !== phase ? (phase = o.phase,
+            o.phase ? `<div style="color:var(--dim);font-weight:650;margin-top:6px">${escapeHtml(o.phase)}</div>` : "") : "";
+          return ph + `<div style="padding:2px 0">${o.seq}. <b>${o.ref}</b> ${escapeHtml(o.title)}</div>`;
+        }).join("");
+    } else {
+      closeModal();
+      toast(`Playlist applied: ${d.count} ordered` +
+            (d.mode === "queue" ? `, ${d.queued.length} queued` : "") +
+            (d.skipped?.length ? `, ${d.skipped.length} skipped` : "") +
+            (d.unmatched?.length ? ` · ${d.unmatched.length} unmatched` : ""));
       load();
     }
   } catch(err){ errEl.textContent = err.message; }
