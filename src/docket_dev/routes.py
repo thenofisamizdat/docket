@@ -282,6 +282,10 @@ def patch_ticket(ticket_id: int, body: TicketPatch, tester: dict = Depends(requi
     if not dk.get_ticket(ticket_id):
         raise HTTPException(status_code=404, detail=f"ticket {ticket_id} not found")
     fields = {k: v for k, v in body.dict().items() if v is not None}
+    # A human choosing an engine here PINS it (the router won't override);
+    # choosing "auto" ('') clears the pin so routing takes over again.
+    if "engine" in fields:
+        fields["engine_pinned"] = 1 if fields["engine"] else 0
     try:
         dk.update_ticket(ticket_id, **fields)
     except ValueError as e:

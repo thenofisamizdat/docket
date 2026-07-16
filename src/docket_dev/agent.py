@@ -587,7 +587,40 @@ def _ctx(t: dict) -> str:
             f"TITLE: {t['title']}\n"
             f"DESCRIPTION: {t.get('description') or '(none)'}\n"
             f"ACCEPTANCE CRITERIA: {t.get('acceptance_criteria') or '(none)'}\n")
-    return base + _prior_rejections_ctx(t)
+    return base + _hierarchy_ctx(t) + _prior_rejections_ctx(t)
+
+
+def _hierarchy_ctx(t: dict) -> str:
+    """The ticket's place in the plan: its epic and (for nested tickets) the
+    parent story + siblings. Scope decisions usually live in the story text —
+    without this the assessor bounces questions the plan already answers
+    ('which option did the parent story choose?')."""
+    out = ""
+    try:
+        if t.get("epic_id"):
+            ep = dk.epics_map().get(t["epic_id"])
+            if ep:
+                out += f"EPIC: {ep['name']}"
+                if (ep.get("description") or "").strip():
+                    out += f" — {ep['description'][:1200]}"
+                out += "\n"
+        if t.get("parent_id"):
+            p = dk.get_ticket(t["parent_id"])
+            if p:
+                out += (f"PARENT STORY {p['ref']} [{p['status']}]: {p['title']}\n"
+                        f"STORY DESCRIPTION: {(p.get('description') or '(none)')[:3000]}\n")
+                if (p.get("acceptance_criteria") or "").strip():
+                    out += f"STORY ACCEPTANCE CRITERIA: {p['acceptance_criteria'][:1500]}\n"
+                sibs = [s for s in dk.children_of(p["id"]) if s["id"] != t["id"]]
+                if sibs:
+                    out += ("SIBLING TICKETS IN THIS STORY: " + "; ".join(
+                        f"{s['ref']} [{s['status']}] {s['title']}" for s in sibs[:10]) + "\n")
+    except Exception:
+        return ""
+    if out:
+        out = ("\nPLAN HIERARCHY CONTEXT — scope and design decisions often live here; "
+               "consult it (and the codebase) BEFORE bouncing for clarification:\n" + out)
+    return out
 
 
 def _prior_rejections_ctx(t: dict) -> str:
@@ -939,7 +972,10 @@ def choose_engine(t: dict) -> tuple[str, str]:
     heuristics: Codex takes the volume lane (small, well-specified tasks/bugs);
     Claude keeps the judgment lane (P0s, stories, low-clarity asks, big
     estimates, resubmits, and anything Codex already struggled on)."""
-    pinned = (t.get("engine") or "").strip().lower()
+    # Only a HUMAN-pinned engine is binding — the router's own earlier stamp
+    # (engine set, pinned=0) is re-evaluated every pickup, so resubmits and
+    # retries can still escalate across engines.
+    pinned = (t.get("engine") or "").strip().lower() if t.get("engine_pinned") else ""
     if pinned == "claude":
         return "claude", "pinned"
     if pinned == "codex":

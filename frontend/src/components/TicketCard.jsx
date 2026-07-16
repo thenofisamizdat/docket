@@ -30,6 +30,14 @@ export default function TicketCard({ ticket, onOpen }) {
             {ticket.epic_name}
           </span>
         )}
+        <span className="flex-1" />
+        {ticket.engine && (
+          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded uppercase tracking-wide shrink-0 ${
+            ticket.engine === 'codex' ? 'bg-teal-100 text-teal-800' : 'bg-indigo-100 text-indigo-700'}`}
+            title={`build engine: ${ticket.engine}`}>
+            ⚙ {ticket.engine}
+          </span>
+        )}
         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${PRIORITY_BADGE[ticket.priority] || 'bg-slate-300'}`}>
           {ticket.priority}
         </span>
@@ -67,14 +75,18 @@ export default function TicketCard({ ticket, onOpen }) {
       )}
 
       <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
-        <span className="flex items-center gap-1.5">
-          {ticket.created_by || '—'}
-          {ticket.engine && (
-            <span className={`px-1 py-px rounded font-medium ${
-              ticket.engine === 'codex' ? 'bg-teal-50 text-teal-700' : 'bg-indigo-50 text-indigo-600'}`}
-              title={`build engine: ${ticket.engine}`}>
-              {ticket.engine}
-            </span>
+        <span className="flex items-center gap-1" title={ticket.assignee
+          ? `assigned to ${ticket.assignee} (raised by ${ticket.created_by || '—'})`
+          : `unassigned (raised by ${ticket.created_by || '—'})`}>
+          {ticket.assignee ? (
+            <>
+              <span className="w-4 h-4 rounded-full bg-indigo-100 text-indigo-700 font-bold text-[8px] inline-flex items-center justify-center">
+                {ticket.assignee.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase()}
+              </span>
+              <span className="text-slate-600 font-medium">{ticket.assignee}</span>
+            </>
+          ) : (
+            <span className="italic">unassigned · by {ticket.created_by || '—'}</span>
           )}
         </span>
         <span className="flex items-center gap-2">
