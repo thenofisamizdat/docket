@@ -897,10 +897,19 @@ def gate_prompt(t: dict) -> str:
         "Hard-but-codeable still counts as BUILD. If the parent story context "
         "already made the decision, the child is BUILD.\n"
         + _ctx(t) +
-        "\nReply with EXACTLY one line:\n"
+        "\nIf it is buildable, reply with EXACTLY one line:\n"
         "GATE: BUILD || <one short sentence why>\n"
-        "or\n"
-        "GATE: HUMAN || <one short sentence why>"
+        "If it needs a person, reply with the GATE line and then the questions "
+        "the requester must answer before an agent can build it:\n"
+        "GATE: HUMAN || <one short sentence why>\n"
+        "NEEDED FROM YOU:\n"
+        "1. <a specific, answerable question — where the ticket implies options, "
+        "name them and what hangs on the choice>\n"
+        "2. <next question, if any>\n"
+        "Address the requester as 'you'. Each question must be answerable in a "
+        "sentence or two, and together they must be sufficient for the agent to "
+        "proceed once answered. Never restate that the ticket needs a human — "
+        "ask the actual questions."
     )
 
 
@@ -1372,9 +1381,18 @@ def process_ticket(t: dict) -> None:
         gv, greason = parse_verdict(g["text"], "GATE")
         if (gv or "").strip().upper() == "HUMAN":
             log(f"  gate → HUMAN ({(greason or '')[:80]})")
-            return _to_needs_info(t, ("This ticket needs a person, not the build "
-                                      f"agent: {greason or 'human decision/process work'}"),
-                                  phase="gate")
+            # The bounce must lead with the actual questions the requester has
+            # to answer — the classification reason alone reads as "not my job"
+            # boilerplate on every gated ticket and tells the human nothing.
+            m = _re.search(r"NEEDED FROM YOU:\s*\n(.+)", g["text"], _re.S | _re.I)
+            needed = (m.group(1).strip()[:2000] if m else "")
+            if needed:
+                q = (f"{needed}\n\n(Why the agent bounced this: "
+                     f"{greason or 'needs a human decision before building'})")
+            else:
+                q = ("This ticket needs a person, not the build agent: "
+                     f"{greason or 'human decision/process work'}")
+            return _to_needs_info(t, q, phase="gate")
 
     if _stop_requested(tid):
         return
