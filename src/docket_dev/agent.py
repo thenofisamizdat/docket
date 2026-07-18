@@ -30,6 +30,7 @@ Run the continuous loop:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import shutil
@@ -747,6 +748,117 @@ def workdir_for(ticket: dict) -> tuple[Path, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Release-gate baseline — the repo's PRE-EXISTING check failures, captured once
+# per base commit so reviews can tell the repo's own breakage apart from a
+# ticket's regressions. Without this, every ticket on a repo with a broken gate
+# burns its full corrective loop "fixing" failures it didn't cause (2026-07-18:
+# 7 tickets × 3 dev passes against 15 pre-existing lint errors).
+# ---------------------------------------------------------------------------
+
+_BASELINE_PATH = MAIN_CHECKOUT / ".docket" / "data" / "gate_baseline.json"
+_BASELINE_LOCK = threading.Lock()
+
+
+def _baseline_capture_prompt() -> str:
+    return (
+        "You are capturing the RELEASE-GATE BASELINE for an autonomous dev "
+        "pipeline: a compact inventory of every check failure that ALREADY "
+        "exists in this repo's current state, so later reviews can tell "
+        "pre-existing breakage apart from a ticket's own regressions.\n\n"
+        "Discover this repo's standard checks (package.json scripts, Makefile, "
+        "CI config, pyproject/pytest, etc.) and RUN the static ones: lint, "
+        "typecheck, unit tests, build. SKIP anything that needs live services, "
+        "real databases, network access, or would mutate data. Do NOT fix "
+        "anything and do NOT modify any file — you are only observing.\n\n"
+        "Then report, compactly and mechanically:\n"
+        "- One line per failing command: the exact command, the failure count, "
+        "and the specific identifiers (lint: rule + file; tests: file + test "
+        "name; build: the first error).\n"
+        "- One line per check that CANNOT run in this environment (e.g. needs "
+        "a browser): 'cannot-run-here: <command> — <why>'.\n"
+        "- If everything passes: 'baseline: all checks pass'.\n"
+        "No prose, no advice — just the inventory."
+    )
+
+
+def gate_baseline(on_activity=None, *, capture: bool = True) -> str:
+    """The repo's pre-existing check failures, cached per base commit in
+    .docket/data/gate_baseline.json. With capture=False, only reads the cache
+    (free) — used by recovery triage, which shouldn't trigger a capture run.
+    Runs in MAIN_CHECKOUT (the only tree with deps installed); the prompt
+    forbids modifications and we verify nothing changed afterwards.
+    Never fatal: any error returns '' and review behaves as before."""
+    try:
+        sha = subprocess.run(["git", "-C", str(MAIN_CHECKOUT), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        if not sha:
+            return ""
+        with _BASELINE_LOCK:
+            try:
+                cached = json.loads(_BASELINE_PATH.read_text())
+                if cached.get("sha") == sha:
+                    return cached.get("text") or ""
+            except Exception:
+                pass
+            if not capture:
+                return ""
+            log(f"  capturing release-gate baseline for {sha[:7]} (once per base commit)")
+            pre = subprocess.run(["git", "-C", str(MAIN_CHECKOUT), "status", "--porcelain"],
+                                 capture_output=True, text=True).stdout
+            r = run_phase(_baseline_capture_prompt(), MAIN_CHECKOUT,
+                          allowed_tools=["Read", "Grep", "Glob", "Bash"],
+                          permission_mode="acceptEdits",
+                          max_turns=30, max_budget_usd=1.5, model=LIGHT_MODEL,
+                          label="gate-baseline", on_activity=on_activity,
+                          engine=("codex" if CODEX_ENABLED else "claude"))
+            post = subprocess.run(["git", "-C", str(MAIN_CHECKOUT), "status", "--porcelain"],
+                                  capture_output=True, text=True).stdout
+            if post != pre:
+                log("  ⚠ gate-baseline capture changed the main checkout's git status — "
+                    "inspect `git status` there (capture is meant to be observe-only)")
+            if r["is_error"]:
+                log(f"  gate-baseline capture failed ({r['text'][:80]}) — proceeding without")
+                return ""
+            text = _strip_control(r["text"]).strip()[:4000]
+            _BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _BASELINE_PATH.write_text(json.dumps(
+                {"sha": sha, "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 "text": text}))
+            return text
+    except Exception as e:
+        log(f"  (gate-baseline unavailable: {e})")
+        return ""
+
+
+def _baseline_ctx(baseline: str) -> str:
+    """Prompt block injected into review / corrective / triage phases when a
+    baseline exists. The rule it states is the whole feature: only NEW failures
+    count against a ticket."""
+    if not (baseline or "").strip():
+        return ""
+    return (
+        "\nKNOWN PRE-EXISTING FAILURES — captured on the repo's base state "
+        "BEFORE this ticket's work. These are the REPO'S own breakage, NOT "
+        "caused by this change:\n" + baseline.strip()[:4000] + "\n"
+        "A check failure counts against THIS ticket ONLY if it is NEW relative "
+        "to that baseline. Never fail the review for, never attempt to 'fix', "
+        "never retry over, and never ask the requester about a baseline "
+        "failure — acknowledge it in one line at most and judge the ticket on "
+        "its own changes.\n"
+    )
+
+
+def _same_failure(a: str, b: str) -> bool:
+    """True when two self-review failure texts describe essentially the same
+    problem — the signal that another corrective pass would be wasted spend."""
+    na = " ".join((a or "").lower().split())[:600]
+    nb = " ".join((b or "").lower().split())[:600]
+    if not na or not nb:
+        return False
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.75
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
@@ -949,14 +1061,14 @@ def implement_prompt(t: dict, plan: str) -> str:
     )
 
 
-def reimplement_prompt(t: dict, plan: str, fix: str) -> str:
+def reimplement_prompt(t: dict, plan: str, fix: str, baseline: str = "") -> str:
     return (
         "You are the implementation phase of an autonomous dev pipeline, on a "
         "CORRECTIVE pass. Your previous changes are already in this worktree but "
         "self-review found problems. FIX exactly those problems — keep what works, "
         "change what's broken. Do not commit or push; just edit files. When done, "
         "briefly summarise what you changed and why it resolves the feedback.\n\n"
-        + _ctx(t) +
+        + _ctx(t) + _baseline_ctx(baseline) +
         "\nSELF-REVIEW FEEDBACK TO ADDRESS:\n" + (fix or "(see prior review)")[:1500] +
         "\n\nORIGINAL PLAN (for reference):\n" + plan[:2500]
     )
@@ -972,7 +1084,7 @@ def test_instructions_prompt(t: dict) -> str:
     )
 
 
-def review_prompt(t: dict) -> str:
+def review_prompt(t: dict, baseline: str = "") -> str:
     return (
         "You are an INDEPENDENT reviewer — NOT the engineer who wrote this code, "
         "and you do not trust their summary. Your DEFAULT verdict is FAIL. You may "
@@ -989,13 +1101,14 @@ def review_prompt(t: dict) -> str:
         "still works. Quote the command(s) you ran and their real output.\n"
         "3. Also run whatever compile/lint/build/tests exist — but treat those as "
         "NECESSARY, NOT SUFFICIENT: they prove the code runs, not that the bug is "
-        "fixed.\n"
+        "fixed. A pre-existing failure listed in the baseline below is NOT this "
+        "ticket's problem and must not affect your verdict.\n"
         "4. Sanity-check you changed the RIGHT surface — does the file you edited "
         "actually back the UI/flow the requester described? If you can't tell, that "
         "is a reason to NOT pass.\n"
         "5. If the fix genuinely cannot be exercised in this worktree (needs a live "
         "service/data you don't have), say so plainly — that is UNVERIFIED.\n\n"
-        + _ctx(t) +
+        + _ctx(t) + _baseline_ctx(baseline) +
         "\nEnd with EXACTLY ONE final line:\n"
         "  REVIEW: PASS  — ONLY if you executed a check reproducing the ticket "
         "scenario and observed the acceptance criteria met (command + output shown above).\n"
@@ -1005,13 +1118,14 @@ def review_prompt(t: dict) -> str:
     )
 
 
-def triage_prompt(t: dict, phase: str, failure: str, diff_summary: str = "") -> str:
+def triage_prompt(t: dict, phase: str, failure: str, diff_summary: str = "",
+                  baseline: str = "") -> str:
     return (
         "You are the RECOVERY-TRIAGE step of an autonomous dev pipeline. A ticket "
         "could not be completed automatically. Your job is to diagnose WHY and "
         "choose the smartest next action — not to fix it now, and never to just "
         "blindly retry. Explore the repo READ-ONLY as needed to judge.\n\n"
-        + _ctx(t) +
+        + _ctx(t) + _baseline_ctx(baseline) +
         f"\nFAILED PHASE: {phase}\nWHAT WENT WRONG:\n{(failure or '(no detail)')[:1800]}\n"
         + (f"\nCHANGES MADE SO FAR:\n{diff_summary[:1000]}\n" if diff_summary else "")
         + "\nDecide the single best recovery and end with EXACTLY ONE final line:\n"
@@ -1179,7 +1293,8 @@ def recover(t: dict, phase: str, failure: str, *, wt=None, diff_summary: str = "
         return _recover_or_stall(tid, f"{phase} failed: {failure[:160]}", transient=True)
     act = lambda d: dk.set_activity(tid, d)
     act("Diagnosing the failure to choose the right recovery")
-    tr = run_phase(triage_prompt(t, phase, failure, diff_summary), wt or MAIN_CHECKOUT,
+    tr = run_phase(triage_prompt(t, phase, failure, diff_summary,
+                                 gate_baseline(capture=False)), wt or MAIN_CHECKOUT,
                    allowed_tools=READONLY_TOOLS, disallowed_tools=["Edit", "Write"],
                    permission_mode="default", max_turns=20, max_budget_usd=1.0,
                    model=LIGHT_MODEL, label="triage", on_activity=act)
@@ -1493,7 +1608,12 @@ def process_ticket(t: dict) -> None:
                                     capture_output=True, text=True).stdout.strip()
                     or BASE_BRANCH)
     iteration = int(t.get("iteration") or 0)
+    # Pre-existing repo breakage, so review/corrective passes only ever bill
+    # this ticket for failures IT introduced. Cached per base commit — the
+    # capture cost amortises to ~zero across the queue.
+    baseline = gate_baseline(on_activity=act)
     fix_feedback = ""
+    prev_feedback = ""
     pr_body = ""
     passed = False
     verified = False          # True only on an EXECUTED, evidence-backed PASS
@@ -1520,7 +1640,7 @@ def process_ticket(t: dict) -> None:
         else:
             act(f"Addressing self-review feedback (pass {attempt}/{MAX_DEV_PASSES}, "
                 f"{pass_model or pass_engine})")
-            impl_prompt = reimplement_prompt(t, p["text"], fix_feedback)
+            impl_prompt = reimplement_prompt(t, p["text"], fix_feedback, baseline)
         if pass_engine != engine:
             dk.add_event(tid, "note", actor="agent",
                          summary=f"🔀 Engine escalation: corrective pass {attempt} runs on "
@@ -1574,14 +1694,14 @@ def process_ticket(t: dict) -> None:
         rev_engine = _review_engine(pass_engine)
         dk.transition(tid, "self_review", actor="agent")
         act(f"Reviewing the work + running checks ({rev_engine})")
-        r = run_phase(review_prompt(t), wt, allowed_tools=WRITE_TOOLS,
+        r = run_phase(review_prompt(t, baseline), wt, allowed_tools=WRITE_TOOLS,
                       permission_mode="acceptEdits", max_turns=25, max_budget_usd=3.0,
                       label="self-review", on_activity=act, engine=rev_engine)
         if r["is_error"] and rev_engine == "codex":
             # A broken review engine must not sink a finished build — fall back
             # to a same-engine (claude) review rather than recovering the ticket.
             log(f"  codex review failed ({r['text'][:80]}) — falling back to claude review")
-            r = run_phase(review_prompt(t), wt, allowed_tools=WRITE_TOOLS,
+            r = run_phase(review_prompt(t, baseline), wt, allowed_tools=WRITE_TOOLS,
                           permission_mode="acceptEdits", max_turns=25, max_budget_usd=3.0,
                           label="self-review", on_activity=act)
             rev_engine = "claude"
@@ -1614,18 +1734,31 @@ def process_ticket(t: dict) -> None:
             unverified_reason = fix or _strip_control(r["text"])[:600]
             break
         fix_feedback = fix or _strip_control(r["text"])[:600]
+        # Circuit breaker: two consecutive reviews failing on essentially the
+        # same problem means iterating cannot fix it (usually environmental or
+        # pre-existing breakage). Stop NOW — every further corrective pass is
+        # pure quota burn (the 2026-07-18 incident's cost multiplier).
+        if prev_feedback and _same_failure(prev_feedback, fix_feedback):
+            dk.add_event(tid, "note", actor="agent", summary=(
+                "⏭ Corrective loop stopped early: self-review failed twice with "
+                "the same failure — another pass would spend more without fixing "
+                "a problem iteration can't reach."))
+            log("  self-review repeated the same failure — stopping the corrective loop early")
+            break
+        prev_feedback = fix_feedback
         if attempt < MAX_DEV_PASSES:
             dk.transition(tid, "in_development", actor="agent",
                           summary=f"Self-review found issues — iterating (pass {attempt + 1}/{MAX_DEV_PASSES})")
             log(f"  self-review FAIL, iterating (pass {attempt + 1}): {fix_feedback[:100]}")
 
     if not passed:
-        # Exhausted the model-escalated corrective loop. Don't just stall —
-        # triage decides whether this is really an underspecified ask (bounce to
-        # the requester) or a genuine blocker (human-gated stall).
+        # Exhausted (or short-circuited) the model-escalated corrective loop.
+        # Don't just stall — triage decides whether this is really an
+        # underspecified ask (bounce to the requester) or a genuine blocker
+        # (human-gated stall).
         files_stat = subprocess.run(["git", "-C", str(wt), "diff", "--stat", base_ref],
                                     capture_output=True, text=True).stdout
-        return recover(t, f"self-review (still failing after {MAX_DEV_PASSES} dev passes)",
+        return recover(t, f"self-review (still failing after {attempt} dev pass(es))",
                        fix_feedback, wt=wt, diff_summary=files_stat)
 
     # Record what the change touched — the join key for post-ship telemetry.
