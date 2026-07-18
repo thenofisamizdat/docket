@@ -895,12 +895,44 @@ def _hierarchy_ctx(t: dict) -> str:
                 if sibs:
                     out += ("SIBLING TICKETS IN THIS STORY: " + "; ".join(
                         f"{s['ref']} [{s['status']}] {s['title']}" for s in sibs[:10]) + "\n")
+        out += _epic_siblings_ctx(t)
     except Exception:
         return ""
     if out:
         out = ("\nPLAN HIERARCHY CONTEXT — scope and design decisions often live here; "
                "consult it (and the codebase) BEFORE bouncing for clarification:\n" + out)
     return out
+
+
+def _epic_siblings_ctx(t: dict) -> str:
+    """The epic's other tickets, in build order, WITH description summaries.
+    Plans are authored as one interlocking system — later tickets reference the
+    review queues, taxonomies and fixtures earlier ones define ('the story
+    below', 'the validation story'). A builder that can't see its siblings asks
+    the requester questions the plan already answers (DKT-696 asked where the
+    needs-review queue lives; DKT-690's text defined it). Window of up to 12
+    siblings centred on this ticket's position in the build order."""
+    if not t.get("epic_id"):
+        return ""
+    try:
+        allt = dk.epic_tickets(t["epic_id"])
+    except Exception:
+        return ""
+    if len(allt) < 2:
+        return ""
+    idx = next((i for i, s in enumerate(allt) if s["id"] == t["id"]), 0)
+    lo = max(0, idx - 6)
+    window = [s for s in allt[lo:lo + 13] if s["id"] != t["id"]][:12]
+    if not window:
+        return ""
+    out = ("EPIC SIBLINGS (this epic's neighbouring tickets, in build order — when "
+           "this ticket references 'the story above/below', a review queue, "
+           "taxonomy or fixtures, the defining text is usually here; read it "
+           "before asking the requester anything):\n")
+    for s in window:
+        desc = " ".join((s.get("description") or "").split())[:280]
+        out += f"- {s['ref']} [{s['status']}] {s['title']}: {desc}\n"
+    return out[:4500]
 
 
 def _answers_ctx(t: dict) -> str:

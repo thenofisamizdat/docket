@@ -943,44 +943,92 @@ def queue() -> List[Dict[str, Any]]:
 def pickup_block_reason(t: Dict[str, Any]) -> str:
     """Why the agent should NOT pick this queued ticket right now ('' = pickable).
 
-    Two rules: (1) human-owned decision tickets are never built by the agent —
-    a person answers them; (2) an implementation child is deferred while any
+    Rules: (1) human-owned decision tickets are never built by the agent — a
+    person answers them; (2) an implementation child is deferred while any
     decision sibling in the same story is unresolved, because that decision IS
-    the missing input (building ahead of it is guesswork). Deliberately NOT
-    keyed on needs_info siblings — bounced siblings must not block each other
-    once the decision lands."""
+    the missing input (building ahead of it is guesswork); (3) tickets in the
+    same EPIC run one at a time, in plan order (build_seq). Plans are written
+    as interlocking sets — later tickets reference the review queues, taxonomies
+    and fixtures earlier ones create, so parallel/out-of-order pickup makes
+    agents build blind against work that doesn't exist in their worktree yet
+    (the 2026-07-18 map-epic failure). Deliberately NOT keyed on needs_info
+    siblings — bounced siblings must not block each other once the answer lands."""
     if t.get("human_only"):
         return "human-owned decision ticket — a person answers it, the agent never builds it"
     pid = t.get("parent_id")
-    if not pid:
+    if pid:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                """SELECT id, title FROM tickets
+                   WHERE parent_id=? AND id != ? AND human_only=1
+                     AND status NOT IN ('done','cancelled')""",
+                (pid, t["id"])).fetchall()
+        finally:
+            conn.close()
+        if rows:
+            r = rows[0]
+            return (f"deferred until decision DKT-{r['id']} is answered "
+                    f"({r['title'][:70]})")
+        # One story child at a time: siblings usually touch the same code, so two
+        # workers building them concurrently just manufactures merge conflicts.
+        conn = _connect()
+        try:
+            placeholders = ",".join("?" * len(AGENT_STAGES))
+            busy = conn.execute(
+                f"""SELECT id FROM tickets WHERE parent_id=? AND id != ?
+                    AND status IN ({placeholders}) LIMIT 1""",
+                (pid, t["id"], *AGENT_STAGES)).fetchone()
+        finally:
+            conn.close()
+        if busy:
+            return f"sibling DKT-{busy['id']} is being worked now — one story child at a time"
+    eid = t.get("epic_id")
+    if not eid:
         return ""
     conn = _connect()
     try:
-        rows = conn.execute(
-            """SELECT id, title FROM tickets
-               WHERE parent_id=? AND id != ? AND human_only=1
-                 AND status NOT IN ('done','cancelled')""",
-            (pid, t["id"])).fetchall()
-    finally:
-        conn.close()
-    if rows:
-        r = rows[0]
-        return (f"deferred until decision DKT-{r['id']} is answered "
-                f"({r['title'][:70]})")
-    # One story child at a time: siblings usually touch the same code, so two
-    # workers building them concurrently just manufactures merge conflicts.
-    conn = _connect()
-    try:
+        # (3a) One epic ticket in flight at a time.
         placeholders = ",".join("?" * len(AGENT_STAGES))
         busy = conn.execute(
-            f"""SELECT id FROM tickets WHERE parent_id=? AND id != ?
+            f"""SELECT id FROM tickets WHERE epic_id=? AND id != ?
                 AND status IN ({placeholders}) LIMIT 1""",
-            (pid, t["id"], *AGENT_STAGES)).fetchone()
+            (eid, t["id"], *AGENT_STAGES)).fetchone()
+        if busy:
+            return (f"DKT-{busy['id']} in this epic is being worked now — "
+                    "epic tickets run one at a time, in plan order")
+        # (3b) In plan order: an earlier-build_seq QUEUED ticket goes first.
+        # A queued human_only decision earlier in the order blocks too — that's
+        # the plan's 'decide X, then build against X' semantic (the decision
+        # shows its amber 'waiting on you' banner meanwhile). Tickets parked in
+        # needs_info/stalled/pr do NOT block — holding a whole epic on a bounce
+        # or on the missing-PAT PR pile would deadlock it.
+        seq = t.get("build_seq")
+        me = (seq if seq is not None else 1000000000, t["id"])
+        for r in conn.execute(
+                """SELECT id, title, build_seq FROM tickets
+                   WHERE epic_id=? AND id != ? AND status='queued'""",
+                (eid, t["id"])).fetchall():
+            other = (r["build_seq"] if r["build_seq"] is not None else 1000000000, r["id"])
+            if other < me:
+                return (f"DKT-{r['id']} comes earlier in this epic's build order "
+                        f"({r['title'][:60]}) — working the epic in plan sequence")
     finally:
         conn.close()
-    if busy:
-        return f"sibling DKT-{busy['id']} is being worked now — one story child at a time"
     return ""
+
+
+def epic_tickets(epic_id: int) -> List[Dict[str, Any]]:
+    """All tickets in an epic, in plan/build order (build_seq, then id)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM tickets WHERE epic_id=?
+               ORDER BY COALESCE(build_seq, 1000000000), id""",
+            (epic_id,)).fetchall()
+        return [_row_to_ticket(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def claim_for_assessment(ticket_id: int) -> bool:
