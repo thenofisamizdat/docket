@@ -547,13 +547,27 @@ def _codex_gitdir(cwd: Path) -> Path | None:
 def _own_tree_for_codex(cwd: Path) -> None:
     """Codex runs as CODEX_USER (the auth owner) while the agent runs as root, so
     hand the working tree (and its worktree git dir) to that user. Root git keeps
-    working regardless of file ownership, so there's no chown-back."""
+    working regardless of file ownership, so there's no chown-back.
+
+    ONLY ever applied to docket-created worktrees. A recursive chown of the MAIN
+    checkout is a live-service killer: real trees embed service data dirs with
+    strict ownership (postgres/data must be uid 999, neo4j/data uid 7474...) and
+    flipping them breaks every new DB connection while existing handles limp on —
+    exactly the 2026-07-19 owl-n4j outage (login dead, deploy failing at the
+    migration step). If codex must run in the main checkout, it runs with the
+    ownership that tree already has."""
     if not CODEX_USER:
         return
-    targets = [cwd]
-    gd = _codex_gitdir(cwd)
-    if gd and gd.exists():
-        targets.append(gd)
+    targets = []
+    try:
+        wt_root = WORKTREE_DIR.resolve()
+        if cwd.resolve().is_relative_to(wt_root):
+            targets.append(cwd)
+            gd = _codex_gitdir(cwd)
+            if gd and gd.exists():
+                targets.append(gd)
+    except Exception:
+        return
     for p in targets:
         subprocess.run(["chown", "-R", CODEX_USER, str(p)], capture_output=True)
 
