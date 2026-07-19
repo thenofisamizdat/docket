@@ -370,13 +370,23 @@ export default function TicketDetail({ ticketId: initialId, meta, onClose, onCha
                   the clean story and the detailed record of every attempt. */}
               <div>
                 <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">History</h3>
+                {/* Newest first: the recap digest, then attempts in reverse
+                    order — what happened most recently is always at the top. */}
                 <div className="space-y-4">
                   {(() => {
                     const segs = groupByIteration(t.events)
                     const multi = segs.length > 1
-                    return segs.map((seg) => (
-                      <IterationBlock key={seg.iter} seg={seg} multi={multi} />
-                    ))
+                    return (
+                      <>
+                        <HistoryDigest segs={segs} />
+                        {segs
+                          .slice()
+                          .reverse()
+                          .map((seg) => (
+                            <IterationBlock key={seg.iter} seg={seg} multi={multi} />
+                          ))}
+                      </>
+                    )
                   })()}
                 </div>
               </div>
@@ -850,6 +860,82 @@ function isReadable(ev) {
   return true
 }
 
+// One concise line per attempt: who built it, how many review passes, how it
+// ended, what it was graded, and (verbatim, clipped) what the requester said.
+// This is the always-visible recap so nobody has to scroll the timeline to
+// learn what has happened on the ticket.
+function buildDigest(segs) {
+  return segs.map((seg) => {
+    const evs = seg.events || []
+    const engineNote = evs.find((e) => /Build engine/.test(e.summary || ''))
+    const engine = engineNote
+      ? (engineNote.summary.match(/\*\*([^*]+)\*\*/) || [])[1] || ''
+      : ''
+    const passes =
+      evs.filter((e) => e.kind === 'transition' && /Self-review found issues/.test(e.summary || '')).length + 1
+    const built = evs.some((e) => e.kind === 'transition' && /in_development/.test(e.summary || ''))
+    const outcomes = []
+    for (const e of evs) {
+      if (e.kind !== 'transition') continue
+      if (/PR .*merged|Branch pushed/.test(e.summary || '')) outcomes.push(e.summary.replace(/ — ready to test/, ''))
+      else if (e.phase === 'stalled') outcomes.push('stalled')
+      else if (e.phase === 'needs_info') outcomes.push('needs info')
+      else if (e.phase === 'done') outcomes.push('done')
+    }
+    const grades = evs
+      .filter((e) => e.kind === 'grade')
+      .map((e) => (e.summary.match(/(\d+)\/10/) || [])[1])
+      .filter(Boolean)
+    const saidRaw = evs.filter(
+      (e) => e.kind === 'comment' && (e.actor || '').toLowerCase() !== 'agent'
+    ).pop()
+    const said = saidRaw ? oneLine(saidRaw.summary.replace(/^Resubmitted:\s*/, ''), 110) : ''
+    const last = evs[evs.length - 1]
+    return {
+      iter: seg.iter,
+      engine,
+      passes: built ? passes : 0,
+      outcome: outcomes.length ? outcomes[outcomes.length - 1] : (last ? `${last.phase}` : ''),
+      grade: grades.length ? `${grades[grades.length - 1]}/10` : '',
+      said,
+      ts: last ? last.ts : null,
+    }
+  })
+}
+
+function HistoryDigest({ segs }) {
+  const rows = buildDigest(segs).reverse()
+  if (!rows.length) return null
+  return (
+    <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2">
+      <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5">
+        The story so far
+      </div>
+      <div className="space-y-1">
+        {rows.map((r) => (
+          <div key={r.iter} className="flex gap-2 text-[11px] text-slate-600">
+            <span className="shrink-0 font-semibold text-slate-500">#{r.iter}</span>
+            <span className="min-w-0">
+              {[
+                r.engine && `built on ${r.engine}`,
+                r.passes > 1 ? `${r.passes} review passes` : r.passes === 1 ? '1 review pass' : null,
+                r.outcome,
+                r.grade && `graded ${r.grade}`,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+              {r.said && (
+                <span className="text-slate-500 italic"> — “{r.said}”</span>
+              )}
+              {r.ts && <span className="ml-1 text-slate-400">{relTime(r.ts)}</span>}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // Split the flat event stream into iteration segments. A new iteration starts
 // each time the ticket re-enters the queue from a failed/bounced state
 // (user_review / needs_info / stalled → queued), i.e. a resubmit. The very
@@ -877,7 +963,9 @@ function oneLine(s, n = 140) {
 }
 
 function IterationBlock({ seg, multi }) {
-  const readable = seg.events.filter(isReadable)
+  // Newest entries first, so the latest activity is visible without scrolling.
+  const readable = seg.events.filter(isReadable).slice().reverse()
+  const detail = seg.events.slice().reverse()
   return (
     <div>
       {multi && (
@@ -896,10 +984,10 @@ function IterationBlock({ seg, multi }) {
       {/* Full system-stage record for this attempt — collapsed by default. */}
       <details className="mt-2">
         <summary className="cursor-pointer text-[11px] text-slate-400 hover:text-slate-600 select-none">
-          ⚙ Detailed log · {seg.events.length} step{seg.events.length === 1 ? '' : 's'}
+          ⚙ Detailed log · {seg.events.length} step{seg.events.length === 1 ? '' : 's'} (newest first)
         </summary>
         <div className="mt-1.5 pl-3 border-l border-slate-100 space-y-1">
-          {seg.events.map((ev) => <DetailEvent key={ev.id} ev={ev} />)}
+          {detail.map((ev) => <DetailEvent key={ev.id} ev={ev} />)}
         </div>
       </details>
     </div>
