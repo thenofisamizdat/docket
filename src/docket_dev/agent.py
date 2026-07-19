@@ -1111,11 +1111,17 @@ def reimplement_prompt(t: dict, plan: str, fix: str, baseline: str = "") -> str:
     return (
         "You are the implementation phase of an autonomous dev pipeline, on a "
         "CORRECTIVE pass. Your previous changes are already in this worktree but "
-        "self-review found problems. FIX exactly those problems — keep what works, "
-        "change what's broken. Do not commit or push; just edit files. When done, "
-        "briefly summarise what you changed and why it resolves the feedback.\n\n"
+        "self-review found problems. FIX every defect listed in the review below — "
+        "ALL of them in this one pass, not just the first: keep what works, change "
+        "what's broken. For EACH numbered defect, after fixing it re-run the check "
+        "the reviewer quoted for it (or an equivalent) and confirm it now passes — "
+        "the next review only confirms; it must not become another round of "
+        "discovery. Do not commit or push; just edit files. When done, summarise "
+        "per defect: what you changed and the re-run check that proves it is "
+        "resolved.\n\n"
         + _ctx(t) + _baseline_ctx(baseline) +
-        "\nSELF-REVIEW FEEDBACK TO ADDRESS:\n" + (fix or "(see prior review)")[:1500] +
+        "\nSELF-REVIEW FEEDBACK TO ADDRESS (fix ALL numbered defects):\n"
+        + (fix or "(see prior review)")[:6000] +
         "\n\nORIGINAL PLAN (for reference):\n" + plan[:2500]
     )
 
@@ -1153,14 +1159,27 @@ def review_prompt(t: dict, baseline: str = "") -> str:
         "actually back the UI/flow the requester described? If you can't tell, that "
         "is a reason to NOT pass.\n"
         "5. If the fix genuinely cannot be exercised in this worktree (needs a live "
-        "service/data you don't have), say so plainly — that is UNVERIFIED.\n\n"
+        "service/data you don't have), say so plainly — that is UNVERIFIED.\n"
+        "6. Finding a defect does NOT end the review. Each corrective cycle is "
+        "expensive, so your failure report must be COMPLETE: after the first proven "
+        "defect, keep going — verify EVERY acceptance criterion and finish every "
+        "check above, so the single fix pass that follows can clear the entire "
+        "list. A review that fails on defect #1 and never looked at criteria 2..N "
+        "is a bad review, even if defect #1 is real.\n\n"
         + _ctx(t) + _baseline_ctx(baseline) +
+        "\nIf your verdict is FAIL, your message body must end (just before the "
+        "verdict line) with a section headed exactly 'DEFECTS FOUND:' — a numbered "
+        "list of EVERY defect you proved, each with the file/location, what is "
+        "wrong, and the command + output that demonstrates it. This list is handed "
+        "verbatim to the fix pass; anything you leave out costs a full extra "
+        "review cycle.\n"
         "\nEnd with EXACTLY ONE final line:\n"
         "  REVIEW: PASS  — ONLY if you executed a check reproducing the ticket "
         "scenario and observed the acceptance criteria met (command + output shown above).\n"
         "  REVIEW: UNVERIFIED || <why it couldn't be executed here, AND the exact "
         "step-by-step a human must run to test it> — change looks plausible but is NOT proven.\n"
-        "  REVIEW: FAIL || <the specific defect to fix> — you found a concrete problem."
+        "  REVIEW: FAIL || <one-line summary: how many defects and their short labels> "
+        "— the full numbered list goes in the DEFECTS FOUND section above."
     )
 
 
@@ -1659,6 +1678,7 @@ def process_ticket(t: dict) -> None:
     # capture cost amortises to ~zero across the queue.
     baseline = gate_baseline(on_activity=act)
     fix_feedback = ""
+    fix_summary = ""
     prev_feedback = ""
     pr_body = ""
     passed = False
@@ -1730,7 +1750,7 @@ def process_ticket(t: dict) -> None:
                    f"to {BASE_BRANCH}. The agent could not determine what to change — typically "
                    "the ask lacks a concrete repro, exact location, or expected behaviour."
                    if attempt == 1 else
-                   f"the corrective pass made no edits despite self-review feedback: {fix_feedback[:200]}")
+                   f"the corrective pass made no edits despite self-review feedback: {fix_summary[:200]}")
             return recover(t, "implementation (no changes produced)", why, wt=wt)
         pr_body = _pr_summary(t, i["text"], files_stat)
 
@@ -1779,23 +1799,28 @@ def process_ticket(t: dict) -> None:
             verified = False
             unverified_reason = fix or _strip_control(r["text"])[:600]
             break
-        fix_feedback = fix or _strip_control(r["text"])[:600]
+        # The corrective pass gets the FULL review body (the DEFECTS FOUND audit),
+        # so one pass can clear every defect; the one-line control detail is what
+        # the repeat-failure breaker compares — a shrinking defect list must not
+        # read as "the same failure again".
+        fix_summary = fix or _strip_control(r["text"])[:600]
+        fix_feedback = _strip_control(r["text"])[:6000] or fix_summary
         # Circuit breaker: two consecutive reviews failing on essentially the
         # same problem means iterating cannot fix it (usually environmental or
         # pre-existing breakage). Stop NOW — every further corrective pass is
         # pure quota burn (the 2026-07-18 incident's cost multiplier).
-        if prev_feedback and _same_failure(prev_feedback, fix_feedback):
+        if prev_feedback and _same_failure(prev_feedback, fix_summary):
             dk.add_event(tid, "note", actor="agent", summary=(
                 "⏭ Corrective loop stopped early: self-review failed twice with "
                 "the same failure — another pass would spend more without fixing "
                 "a problem iteration can't reach."))
             log("  self-review repeated the same failure — stopping the corrective loop early")
             break
-        prev_feedback = fix_feedback
+        prev_feedback = fix_summary
         if attempt < MAX_DEV_PASSES:
             dk.transition(tid, "in_development", actor="agent",
                           summary=f"Self-review found issues — iterating (pass {attempt + 1}/{MAX_DEV_PASSES})")
-            log(f"  self-review FAIL, iterating (pass {attempt + 1}): {fix_feedback[:100]}")
+            log(f"  self-review FAIL, iterating (pass {attempt + 1}): {fix_summary[:100]}")
 
     if not passed:
         # Exhausted (or short-circuited) the model-escalated corrective loop.
