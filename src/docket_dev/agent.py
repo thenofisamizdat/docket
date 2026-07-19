@@ -995,11 +995,20 @@ def _prior_rejections_ctx(t: dict) -> str:
     human = [e for e in events
              if e.get("kind") in ("comment", "resubmit")
              and (e.get("actor") or "").lower() not in ("agent", "system", "")]
-    notes = "\n".join(f"  - {(e.get('summary') or '').strip()[:300]}" for e in human[-4:])
+    # NEVER truncate an individual rejection to a snippet: the DKT-932 incident
+    # cut a 453-char correction at 300 chars, silently dropping half the
+    # requester's requirements — the agent then built exactly the half it saw.
+    # Keep each comment whole (generous per-comment cap, newest comments last).
+    notes = "\n".join(f"  - {(e.get('summary') or '').strip()[:2500]}"
+                      for e in human[-6:])
     return (
         f"\n⚠ THIS IS ATTEMPT #{it + 1}. Earlier agent attempts shipped a fix that the "
         f"requester TESTED and REJECTED. Repeating the same approach will fail again.\n"
         + (f"What the requester says is STILL wrong (their words):\n{notes}\n" if notes else "")
+        + "Every sentence of the rejection feedback above is a REQUIREMENT of this "
+          "attempt, in addition to the original acceptance criteria. Enumerate each "
+          "distinct point the requester makes and address ALL of them — shipping a "
+          "subset guarantees another rejection.\n"
         + "Before coding: re-derive — from the requester's description — the EXACT UI "
           "surface/route/component they are using. A prior attempt may have changed the "
           "WRONG place. If your plan looks like the last one, change the approach.\n"
@@ -1165,7 +1174,12 @@ def review_prompt(t: dict, baseline: str = "") -> str:
         "defect, keep going — verify EVERY acceptance criterion and finish every "
         "check above, so the single fix pass that follows can clear the entire "
         "list. A review that fails on defect #1 and never looked at criteria 2..N "
-        "is a bad review, even if defect #1 is real.\n\n"
+        "is a bad review, even if defect #1 is real.\n"
+        "7. If this ticket carries REJECTION FEEDBACK from a prior attempt (see "
+        "context below), that feedback is a checklist: break it into its distinct "
+        "points and verify EACH one individually with an executed check. Passing "
+        "the original criteria while any rejection point is unaddressed is a FAIL "
+        "— the requester already told you the original criteria were not enough.\n\n"
         + _ctx(t) + _baseline_ctx(baseline) +
         "\nIf your verdict is FAIL, your message body must end (just before the "
         "verdict line) with a section headed exactly 'DEFECTS FOUND:' — a numbered "
